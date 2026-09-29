@@ -1,0 +1,98 @@
+:root {
+  --bg: #0f1420;
+  --panel: #171e2e;
+  --panel-2: #1e2740;
+  --line: #2b3656;
+  --text: #e6ecf8;
+  --muted: #93a0bd;
+  --ok: #38d39f;
+  --bad: #ff6b6b;
+  --warn: #ffb454;
+  --accent: #6ea8fe;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.topbar {
+  display: flex; align-items: center; gap: 16px;
+  padding: 14px 22px; border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+.topbar h1 { font-size: 17px; margin: 0; }
+.topbar .sub { color: var(--muted); font-size: 12.5px; }
+.spacer { flex: 1; }
+
+.layout { display: grid; grid-template-columns: 330px 1fr; gap: 16px; padding: 16px 22px; }
+.panel {
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: 12px; padding: 16px;
+}
+.panel h2 { font-size: 14px; margin: 0 0 12px; }
+
+button {
+  background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
+  border-radius: 8px; padding: 7px 12px; font-size: 13px; cursor: pointer;
+}
+button:hover { border-color: var(--accent); }
+button.primary { background: #23447c; border-color: #3560a8; }
+button.danger { background: #5a2530; border-color: #8a3745; }
+button:disabled { opacity: .5; cursor: not-allowed; }
+
+input, select, textarea {
+  width: 100%; background: var(--bg); color: var(--text);
+  border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; font-size: 13px;
+}
+label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
+
+.entity { border: 1px solid var(--line); border-radius: 10px; padding: 10px; margin-bottom: 10px; background: var(--panel-2); }
+.entity .name { font-weight: 600; font-size: 13.5px; }
+.entity .desc { color: var(--muted); font-size: 11.5px; margin: 2px 0 6px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip {
+  font-size: 11px; padding: 3px 8px; border-radius: 999px; border: 1px solid var(--line);
+  background: var(--bg); cursor: pointer;
+}
+.chip.sel { border-color: var(--accent); color: var(--accent); }
+.chip.revoked { border-color: var(--bad); color: var(--bad); text-decoration: line-through; }
+.chip.cross { border-style: dashed; }
+
+.kind-root { color: var(--warn); }
+.kind-intermediate { color: var(--accent); }
+.kind-leaf { color: var(--ok); }
+
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.muted { color: var(--muted); font-size: 12px; }
+.error { color: var(--bad); font-size: 12.5px; margin-top: 8px; white-space: pre-wrap; }
+.ok-text { color: var(--ok); }
+.bad-text { color: var(--bad); }
+
+.verdict { border-radius: 10px; padding: 12px 14px; margin-bottom: 12px; font-weight: 600; }
+.verdict.pass { background: rgba(56,211,159,.12); border: 1px solid var(--ok); }
+.verdict.fail { background: rgba(255,107,107,.12); border: 1px solid var(--bad); }
+
+.path { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; margin-bottom: 10px; }
+.path.valid { border-color: var(--ok); }
+.path.invalid { border-color: var(--bad); }
+.path .flow { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 6px 0; }
+.node {
+  font-size: 11.5px; padding: 4px 8px; border-radius: 6px;
+  background: var(--bg); border: 1px solid var(--line);
+}
+.node.bad { border-color: var(--bad); color: var(--bad); }
+.node.cross { border-style: dashed; }
+.arrow { color: var(--muted); }
+.reasons { margin: 6px 0 0; padding-left: 18px; }
+.reasons li { font-size: 12px; color: var(--warn); }
+
+.graph { width: 100%; height: 420px; background: var(--panel-2); border-radius: 10px; border: 1px solid var(--line); }
+.tabs { display: flex; gap: 8px; margin-bottom: 12px; }
+.tabs button.active { background: #23447c; border-color: var(--accent); }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.trust-list label { display: flex; align-items: center; gap: 8px; color: var(--text); font-size: 12.5px; margin: 6px 0; }
+.trust-list input { width: auto; }

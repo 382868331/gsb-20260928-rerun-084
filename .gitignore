@@ -6,3 +6,7 @@ __pycache__/
 .env.*
 *.pem
 *.key
+# local certificate experiment area
+.certlab-experiment/
+frontend/dist/
+backend/bin/
