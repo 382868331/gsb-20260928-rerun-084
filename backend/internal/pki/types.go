@@ -34,12 +34,15 @@ type Cert struct {
 	IssuerID  string // logical node that signed this certificate
 	ParentID  string // logical node of the issuing certificate when cross-signed
 	EKUs      []x509.ExtKeyUsage
-	Key       any    // *rsa.PrivateKey / *ecdsa.PrivateKey; local only
+	Key       any // *rsa.PrivateKey / *ecdsa.PrivateKey; local only
 	Cert      *x509.Certificate
 	PEM       string // CERTIFICATE PEM
 	RevokedAt time.Time
 	Revoked   bool
 	Expires   time.Time
+	// CRLPublished reports whether this CA node publishes revocation data.
+	// False models missing CRL information for an otherwise valid CA.
+	CRLPublished bool
 }
 
 // EncodePEM renders a DER certificate as PEM text.
@@ -51,20 +54,21 @@ func EncodePEM(der []byte) string {
 // PublicView is the safe representation sent over HTTP. It never contains
 // private key material.
 type PublicView struct {
-	ID        string     `json:"id"`
-	Label     string     `json:"label"`
-	Kind      NodeKind   `json:"kind"`
-	IssuerID  string     `json:"issuerId"`
-	ParentID  string     `json:"parentId,omitempty"`
-	EKUs      []string   `json:"ekus"`
-	Subject   string     `json:"subject"`
-	Issuer    string     `json:"issuer"`
-	Serial    string     `json:"serial"`
-	NotBefore time.Time  `json:"notBefore"`
-	NotAfter  time.Time  `json:"notAfter"`
-	Revoked   bool       `json:"revoked"`
-	RevokedAt *time.Time `json:"revokedAt,omitempty"`
-	PEM       string     `json:"pem"`
+	ID           string     `json:"id"`
+	Label        string     `json:"label"`
+	Kind         NodeKind   `json:"kind"`
+	IssuerID     string     `json:"issuerId"`
+	ParentID     string     `json:"parentId,omitempty"`
+	EKUs         []string   `json:"ekus"`
+	Subject      string     `json:"subject"`
+	Issuer       string     `json:"issuer"`
+	Serial       string     `json:"serial"`
+	NotBefore    time.Time  `json:"notBefore"`
+	NotAfter     time.Time  `json:"notAfter"`
+	Revoked      bool       `json:"revoked"`
+	RevokedAt    *time.Time `json:"revokedAt,omitempty"`
+	CRLPublished bool       `json:"crlPublished"`
+	PEM          string     `json:"pem"`
 }
 
 func ekuNames(usages []x509.ExtKeyUsage) []string {
@@ -84,15 +88,15 @@ func ekuNames(usages []x509.ExtKeyUsage) []string {
 // View returns the private-key-free representation of a cert.
 func (c *Cert) View() PublicView {
 	v := PublicView{
-		ID:       c.ID,
-		Label:    c.Label,
-		Kind:     c.Kind,
-		IssuerID: c.IssuerID,
-		ParentID: c.ParentID,
-		EKUs:     ekuNames(c.EKUs),
-		Subject:  c.Cert.Subject.String(),
-		Issuer:   c.Cert.Issuer.String(),
-		Serial:   c.Cert.SerialNumber.String(),
+		ID:        c.ID,
+		Label:     c.Label,
+		Kind:      c.Kind,
+		IssuerID:  c.IssuerID,
+		ParentID:  c.ParentID,
+		EKUs:      ekuNames(c.EKUs),
+		Subject:   c.Cert.Subject.String(),
+		Issuer:    c.Cert.Issuer.String(),
+		Serial:    c.Cert.SerialNumber.String(),
 		NotBefore: c.Cert.NotBefore,
 		NotAfter:  c.Cert.NotAfter,
 		Revoked:   c.Revoked,
@@ -102,5 +106,6 @@ func (c *Cert) View() PublicView {
 		t := c.RevokedAt
 		v.RevokedAt = &t
 	}
+	v.CRLPublished = c.CRLPublished
 	return v
 }

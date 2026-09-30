@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>证书生命周期实验平台</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header>
+    <h1>证书生命周期实验平台</h1>
+    <div class="meta">
+      <span>规则版本 <b id="rulesVersion">-</b></span>
+      <span>实验时钟 <b id="clock">-</b></span>
+      <button id="loadSamples">载入本地样例</button>
+      <button id="reset" class="ghost">清空</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="panel">
+      <h2>签发与轮换</h2>
+      <div class="grid">
+        <form id="rootForm" class="card">
+          <h3>新建根 CA</h3>
+          <input name="id" placeholder="ID，如 rootE" required />
+          <input name="cn" placeholder="名称 CN" required />
+          <input name="years" type="number" placeholder="有效期（年）默认 10" />
+          <button>签发根证书</button>
+        </form>
+
+        <form id="intermediateForm" class="card">
+          <h3>新建 / 交叉签发中间证书</h3>
+          <input name="id" placeholder="新证书 ID" required />
+          <input name="cn" placeholder="名称 CN" required />
+          <input name="issuerId" placeholder="签发者 ID（根或中间）" required />
+          <input name="crossSubjectId" placeholder="交叉签发对象 ID（可空）" />
+          <input name="years" type="number" placeholder="有效期年数（-1 表示已过期）" />
+          <button>签发中间证书</button>
+        </form>
+
+        <form id="leafForm" class="card">
+          <h3>签发终端证书</h3>
+          <input name="id" placeholder="新证书 ID" required />
+          <input name="cn" placeholder="CN / 域名" required />
+          <input name="issuerId" placeholder="签发 CA 的 ID" required />
+          <input name="dns" placeholder="DNS，逗号分隔" />
+          <label class="check"><input type="checkbox" name="server" checked /> serverAuth</label>
+          <label class="check"><input type="checkbox" name="client" /> clientAuth</label>
+          <input name="days" type="number" placeholder="有效期天数默认 90" />
+          <button>签发终端证书</button>
+        </form>
+
+        <form id="rotateForm" class="card">
+          <h3>轮换终端证书（新密钥）</h3>
+          <input name="leafId" placeholder="旧终端证书 ID" required />
+          <input name="newId" placeholder="新证书 ID" required />
+          <input name="newIssuerId" placeholder="新签发 CA（可与旧 CA 不同）" required />
+          <input name="days" type="number" placeholder="有效期天数默认 90" />
+          <button>轮换签发</button>
+        </form>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>信任与撤销资料</h2>
+      <p class="hint">信任开关只对根证书生效；“发布 CRL” 关闭表示该 CA 撤销资料缺失。</p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>ID</th><th>类型</th><th>主体 / 用途</th><th>有效期</th><th>状态</th><th>操作</th></tr>
+          </thead>
+          <tbody id="certRows"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>验证</h2>
+      <form id="verifyForm" class="inline">
+        <select name="leafId" id="verifyLeaf" required></select>
+        <select name="purpose">
+          <option value="serverAuth">serverAuth</option>
+          <option value="clientAuth">clientAuth</option>
+        </select>
+        <button>重新验证（保留旧证据）</button>
+      </form>
+      <div id="verifyResult" class="result"></div>
+    </section>
+
+    <section class="panel">
+      <h2>历史验证证据（不可覆盖）</h2>
+      <div id="history" class="history"></div>
+    </section>
+  </main>
+
+  <div id="toast"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

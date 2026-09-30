@@ -69,11 +69,11 @@ func CreateRoot(id, cn string, notBefore, notAfter time.Time, seq *atomic.Uint64
 // IssueOptions parameterizes a new signed certificate.
 type IssueOptions struct {
 	ID, Label, CN string
-	Intermediate bool
-	EKUs         []EKU
-	NotBefore    time.Time
-	NotAfter     time.Time
-	DNSNames     []string
+	Intermediate  bool
+	EKUs          []EKU
+	NotBefore     time.Time
+	NotAfter      time.Time
+	DNSNames      []string
 }
 
 // Issue signs a new certificate with the issuer's key. For a cross-signed
@@ -103,7 +103,7 @@ func Issue(issuer *Cert, opts IssueOptions, subjectOverride *Cert, seq *atomic.U
 		tmpl.ExtKeyUsage = ekuFromNames(opts.EKUs)
 	}
 
-	publicKey := &key.PublicKey
+	var publicKey any = &key.PublicKey
 	subjectCert := tmpl
 	if subjectOverride != nil {
 		// Cross-signature: reuse the existing intermediate's public key and
@@ -135,10 +135,7 @@ func Issue(issuer *Cert, opts IssueOptions, subjectOverride *Cert, seq *atomic.U
 		EKUs: ekuFromNames(ecus),
 	}
 	if subjectOverride != nil {
-		// The cross certificate shares the subject's key; keep a reference to
-		// that key so the lab can keep issuing under the cross identity if
-		// needed, but the canonical private key lives with the subject node.
-		c.Key = subjectOverride.Key
+		c.Key = nil
 		c.Kind = KindCross
 		c.ParentID = subjectOverride.ID
 	}
