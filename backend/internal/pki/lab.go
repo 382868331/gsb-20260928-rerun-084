@@ -1,7 +1,6 @@
 package pki
 
 import (
-	"crypto/rand"
 	"crypto/x509"
 	"fmt"
 	"sync"
@@ -73,23 +72,22 @@ func (l *Lab) AddRoot(id, cn string, years int) (*Cert, error) {
 // AddIntermediate issues an intermediate under issuerID. When crossSubjectID
 // is set, a cross certificate for that existing intermediate is created
 // instead of a fresh key (used during root migration).
-func (l *Lab) AddIntermediate(id, cn, issuerID, crossSubjectID string, years int) (*Cert, error) {
+func (l *Lab) AddIntermediate(id, cn, issuerID, crossSubjectID string, notBefore, notAfter time.Time) (*Cert, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	issuer, ok := l.certs[issuerID]
 	if !ok {
 		return nil, fmt.Errorf("issuer %q not found", issuerID)
 	}
-	now := l.nowFunc()
 	opts := IssueOptions{
 		ID: id, Label: cn, CN: cn, Intermediate: true,
-		NotBefore: now.Add(-time.Minute), NotAfter: now.AddDate(years, 0, 0),
+		NotBefore: notBefore, NotAfter: notAfter,
 	}
 	var override *Cert
 	if crossSubjectID != "" {
 		sub, ok := l.certs[crossSubjectID]
 		if !ok {
-		return nil, fmt.Errorf("cross subject %q not found", crossSubjectID)
+			return nil, fmt.Errorf("cross subject %q not found", crossSubjectID)
 		}
 		override = sub
 		opts.Label = cn
@@ -123,6 +121,60 @@ func (l *Lab) AddLeaf(id, cn, issuerID string, ekus []EKU, dnsNames []string, da
 	}
 	l.put(c)
 	return c, nil
+}
+
+// RotateLeaf re-issues an end-entity certificate under the same issuer with a
+// fresh key and validity window. The old certificate is retained as evidence
+// and marked as superseded (it is not automatically revoked).
+func (l *Lab) RotateLeaf(oldID, newID string, days int) (*Cert, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	old, ok := l.certs[oldID]
+	if !ok {
+		return nil, fmt.Errorf("cert %q not found", oldID)
+	}
+	if old.Kind != KindLeaf {
+		return nil, fmt.Errorf("cert %q is not a leaf", oldID)
+	}
+	issuer, ok := l.certs[old.IssuerID]
+	if !ok {
+		return nil, fmt.Errorf("issuer %q not found", old.IssuerID)
+	}
+	now := l.nowFunc()
+	ekus := make([]EKU, 0, len(old.Cert.ExtKeyUsage))
+	for _, u := range old.Cert.ExtKeyUsage {
+		switch u {
+		case x509.ExtKeyUsageServerAuth:
+			ekus = append(ekus, EKUServer)
+		case x509.ExtKeyUsageClientAuth:
+			ekus = append(ekus, EKUClient)
+		}
+	}
+	c, err := Issue(issuer, IssueOptions{
+		ID: newID, Label: old.Label + " (rotated)", CN: old.Cert.Subject.CommonName,
+		EKUs: ekus, DNSNames: append([]string{}, old.Cert.DNSNames...),
+		NotBefore: now.Add(-time.Minute), NotAfter: now.AddDate(0, 0, days),
+	}, nil, &l.seq)
+	if err != nil {
+		return nil, err
+	}
+	l.put(c)
+	old.SupersededBy = newID
+	return c, nil
+}
+
+// SetCRLPublished toggles whether a CA publishes revocation data. When
+// published is false the lab simulates a CA whose CRL endpoint is missing,
+// which must fail chains that require revocation evidence.
+func (l *Lab) SetCRLPublished(caID string, published bool) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	c, ok := l.certs[caID]
+	if !ok {
+		return fmt.Errorf("ca %q not found", caID)
+	}
+	c.CRLBlocked = !published
+	return nil
 }
 
 // SetTrust marks a root as trusted (anchor) or distrusted. Old and new roots
@@ -170,26 +222,19 @@ func (l *Lab) Revoke(id string) error {
 // can never serve stale revocation data.
 func (l *Lab) CRL(caID string) ([]byte, error) {
 	l.mu.RLock()
-	defer l.mu.RUnlock()
 	ca, ok := l.certs[caID]
+	blocked := false
+	if ok {
+		blocked = ca.CRLBlocked
+	}
+	l.mu.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("ca %q not found", caID)
 	}
-	now := l.nowFunc()
-	revoked := []x509.RevocationList{}
-	for _, c := range l.certs {
-		if c.IssuerID == caID && c.Revoked {
-			revoked = append(revoked, x509.RevocationList{
-				SerialNumber: c.Cert.SerialNumber,
-				RevokedAt:    c.RevokedAt,
-			})
-		}
+	if blocked {
+		return nil, fmt.Errorf("CA %q does not publish revocation data (CRL unavailable)", caID)
 	}
-	tmpl := &x509.RevocationList{
-		Number:     l.seq.Add(1),
-		ThisUpdate: now.Add(-time.Minute),
-		NextUpdate: now.Add(time.Hour),
-		RevokedCertificates: revoked,
-	}
-	return x509.CreateRevocationList(rand.Reader, tmpl, ca.Cert, ca.Key)
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.buildCRLLocked(ca)
 }

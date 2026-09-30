@@ -69,11 +69,11 @@ func CreateRoot(id, cn string, notBefore, notAfter time.Time, seq *atomic.Uint64
 // IssueOptions parameterizes a new signed certificate.
 type IssueOptions struct {
 	ID, Label, CN string
-	Intermediate bool
-	EKUs         []EKU
-	NotBefore    time.Time
-	NotAfter     time.Time
-	DNSNames     []string
+	Intermediate  bool
+	EKUs          []EKU
+	NotBefore     time.Time
+	NotAfter      time.Time
+	DNSNames      []string
 }
 
 // Issue signs a new certificate with the issuer's key. For a cross-signed
@@ -109,7 +109,7 @@ func Issue(issuer *Cert, opts IssueOptions, subjectOverride *Cert, seq *atomic.U
 		// Cross-signature: reuse the existing intermediate's public key and
 		// subject identity; the new cert chain therefore represents the same
 		// private key under a different issuer.
-		publicKey = subjectOverride.Cert.PublicKey
+		publicKey = subjectOverride.Cert.PublicKey.(*ecdsa.PublicKey)
 		tmpl.Subject = subjectOverride.Cert.Subject
 		subjectCert = tmpl
 	}
@@ -135,12 +135,16 @@ func Issue(issuer *Cert, opts IssueOptions, subjectOverride *Cert, seq *atomic.U
 		EKUs: ekuFromNames(ecus),
 	}
 	if subjectOverride != nil {
-		// The cross certificate shares the subject's key; keep a reference to
-		// that key so the lab can keep issuing under the cross identity if
-		// needed, but the canonical private key lives with the subject node.
+		// A cross certificate is an alternative certificate for the SAME
+		// subject (same DN and public key) signed by a different issuer. It
+		// does not itself sign anything: path enumeration reaches the new
+		// root by substituting this certificate for the subject node. Its
+		// IssuerID records the subject node, and ParentID records the
+		// cross-signing CA.
 		c.Key = subjectOverride.Key
 		c.Kind = KindCross
-		c.ParentID = subjectOverride.ID
+		c.IssuerID = subjectOverride.ID
+		c.ParentID = issuer.ID
 	}
 	return c, nil
 }
