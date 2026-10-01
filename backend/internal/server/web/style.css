@@ -95,6 +95,8 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; }
 .history { display: flex; flex-direction: column; gap: 10px; }
 .evidence { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; background: #121a2c; }
 .evidence summary { cursor: pointer; }
+.compare { margin: 8px 0; padding: 8px 12px; border-left: 3px solid var(--warn); background: #182033; border-radius: 0 8px 8px 0; }
+.compare ul { margin: 6px 0 0; padding-left: 18px; }
 
 #toast {
   position: fixed; right: 20px; bottom: 20px; display: flex; flex-direction: column; gap: 8px; z-index: 50;

@@ -47,8 +47,8 @@ function renderRows(state) {
   rows.innerHTML = "";
   for (const c of state.certs) {
     const tr = document.createElement("tr");
-    const trusted = state.trustedRoots.includes(c.id);
-    const purposes = c.kind === "leaf" ? (c.ekus.join(", ") || "-") : "CA";
+    const trusted = (state.trustedRoots || []).includes(c.id);
+    const purposes = c.kind === "leaf" ? ((c.ekus || []).join(", ") || "-") : "CA";
     const status = [];
     if (c.kind === "root") status.push(trusted ? `<span class="ok-text">受信任</span>` : `<span class="bad-text">不信任</span>`);
     const now = new Date(state.now);
@@ -100,7 +100,7 @@ function pathArrow(step, isFirst) {
     (step.trusted ? " · 受信任锚点" : "") +
     (step.expired ? " · <span class=\"bad-text\">期限不满足</span>" : "") +
     (step.revoked ? " · <span class=\"bad-text\">已撤销</span>" : "") +
-    (!step.crlPublished ? " · <span class=\"warn-text\">撤销资料缺失</span>" : "") +
+    (!step.crlPublished ? " · <span class=\"warn-text\">撤销资料缺失，撤销状态无法确定</span>" : "") +
     `</small></div>`;
 }
 
@@ -109,32 +109,80 @@ function renderResult(res, target) {
     <div class="verdict ${res.valid ? "ok" : "bad"}">` +
       `${res.valid ? "✓ 验证通过" : "✗ 验证失败"} · 证书 ${res.leafId} · 用途 ${res.purpose} · 证据 #${res.evidenceId} · 规则版本 ${res.rulesVersion}</div>
     <div class="muted">${res.valid ? "实际采用路径：" + (res.selectedPath || []).join(" → ") : "失败原因：" + (res.reason || "-")}</div>
-    <div class="muted">受信任根：${res.trustedRoots.join(", ") || "（无）"} · 检查时间 ${fmtDate(res.checkedAt)}</div>
-    ${res.chains.map(ch => `
+    <div class="muted">受信任根：${(res.trustedRoots || []).join(", ") || "（无）"} · 检查时间 ${fmtDate(res.checkedAt)}</div>
+    ${(res.chains || []).map(ch => `
       <div class="chain ${ch.valid ? "ok" : "bad"}">
         <b>${ch.valid ? "可用路径" : "无效路径"}</b>
-        ${ch.reason ? ` <span class="bad-text">— ${ch.reason}</span>` : " <span class="ok-text">— 签名、期限、用途、锚点与撤销资料均满足</span>"}
+        ${ch.reason ? ` <span class="bad-text">— ${ch.reason}</span>` : ` <span class="ok-text">— 签名、期限、用途、锚点与撤销资料均满足</span>`}
         ${ch.path.map((s, i) => pathArrow(s, i === 0)).join("")}
       </div>`).join("")}`;
+}
+
+function reprChain(res) {
+  const chains = res.chains || [];
+  return chains.find(c => c.valid) || chains[0] || null;
+}
+
+function stepMap(res) {
+  const m = new Map();
+  const ch = reprChain(res);
+  if (ch) for (const s of ch.path || []) m.set(s.id, s);
+  return m;
+}
+
+function fmtStepState(s) {
+  const parts = [];
+  if (s.kind === "root") parts.push(s.trusted ? "受信任锚点" : "非信任锚点");
+  parts.push(s.expired ? "期限不满足" : "期限内");
+  parts.push(s.revoked ? "已撤销" : "未撤销");
+  if (s.kind !== "leaf") parts.push(s.crlPublished ? "撤销资料正常" : "撤销资料缺失（无法确定撤销状态）");
+  return parts.join("，");
+}
+
+function renderCompare(prev, cur) {
+  const lines = [];
+  if (prev.rulesVersion !== cur.rulesVersion) lines.push(`规则版本 v${prev.rulesVersion} → v${cur.rulesVersion}`);
+  if (prev.valid !== cur.valid) lines.push(`结论：${prev.valid ? "✓ 通过" : "✗ 失败"} → ${cur.valid ? "✓ 通过" : "✗ 失败"}`);
+  const pPath = (prev.selectedPath || []).join(" → ") || "（无有效路径）";
+  const cPath = (cur.selectedPath || []).join(" → ") || "（无有效路径）";
+  if (pPath !== cPath) lines.push(`采用路径：${pPath} ⇒ ${cPath}`);
+  const pRoots = new Set(prev.trustedRoots || []);
+  const cRoots = new Set(cur.trustedRoots || []);
+  for (const r of cRoots) if (!pRoots.has(r)) lines.push(`信任根新增：${r}`);
+  for (const r of pRoots) if (!cRoots.has(r)) lines.push(`信任根移除：${r}`);
+  const pm = stepMap(prev);
+  const cm = stepMap(cur);
+  for (const [id, cs] of cm) {
+    const ps = pm.get(id);
+    if (!ps) { lines.push(`${id}：新出现在采用路径（${fmtStepState(cs)}）`); continue; }
+    const before = fmtStepState(ps);
+    const after = fmtStepState(cs);
+    if (before !== after) lines.push(`${id}：${before} ⇒ ${after}`);
+  }
+  for (const id of pm.keys()) if (!cm.has(id)) lines.push(`${id}：不再出现在采用路径`);
+  if (!lines.length) lines.push("与上一条同证书证据相比，规则与路径状态无变化。");
+  return `<div class="compare"><b>与证据 #${prev.evidenceId}（规则 v${prev.rulesVersion} · ${fmtDate(prev.checkedAt)}）的路径比较</b><ul>${lines.map(l => `<li>${l}</li>`).join("")}</ul></div>`;
 }
 
 function renderHistory(history) {
   const box = $("#history");
   box.innerHTML = history.length ? "" : `<p class="muted">暂无验证证据。</p>`;
-  for (const res of history) {
+  history.forEach((res, i) => {
+    const prev = history.slice(i + 1).find(h => h.leafId === res.leafId && h.purpose === res.purpose);
     const details = document.createElement("details");
     details.className = "evidence";
-    details.open = res.evidenceId === history[0].evidenceId;
+    details.open = i === 0;
     details.innerHTML = `
       <summary>
         <span class="${res.valid ? "ok-text" : "bad-text"}"><b>${res.valid ? "✓ 通过" : "✗ 失败"}</b></span>
         证据 #${res.evidenceId} · 规则 v${res.rulesVersion} · ${res.leafId} · ${res.purpose} · ${fmtDate(res.checkedAt)}
-        ${res.valid ? ` · 路径 ${res.selectedPath.join(" → ")}` : ` · ${res.reason}`}
+        ${res.valid ? ` · 路径 ${(res.selectedPath || []).join(" → ")}` : ` · ${res.reason}`}
       </summary>
+      ${prev ? renderCompare(prev, res) : ""}
       <div id="ev-${res.evidenceId}"></div>`;
     box.appendChild(details);
     renderResult(res, details.querySelector(`#ev-${res.evidenceId}`));
-  }
+  });
 }
 
 function bindForms() {
