@@ -127,6 +127,13 @@ func TestHistoryAndCRLAndIndex(t *testing.T) {
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "证书生命周期") {
 		t.Fatalf("index page not served: %d", rec.Code)
 	}
+
+	req = httptest.NewRequest("GET", "/app.js", nil)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "addEventListener") {
+		t.Fatalf("app script not served: %d", rec.Code)
+	}
 }
 
 func TestIssueAndRotateOverHTTP(t *testing.T) {

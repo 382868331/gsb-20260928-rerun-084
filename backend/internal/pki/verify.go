@@ -7,7 +7,6 @@ import (
 	"time"
 )
 
-// PathStep describes one node of a candidate verification path.
 type PathStep struct {
 	ID           string    `json:"id"`
 	Label        string    `json:"label"`
@@ -22,14 +21,29 @@ type PathStep struct {
 	Trusted      bool      `json:"trusted,omitempty"`
 }
 
-// ChainReport is one attempted root-to-leaf path with its evaluation.
-type ChainReport struct {
-	Path   []PathStep `json:"path"`
-	Valid  bool       `json:"valid"`
-	Reason string     `json:"reason,omitempty"`
+type CheckStatus string
+
+const (
+	CheckPass    CheckStatus = "pass"
+	CheckFail    CheckStatus = "fail"
+	CheckUnknown CheckStatus = "unknown"
+	CheckSkipped CheckStatus = "skipped"
+)
+
+type PathCheck struct {
+	Name   string      `json:"name"`
+	Status CheckStatus `json:"status"`
+	Detail string      `json:"detail"`
 }
 
-// VerifyResult is one immutable verification answer.
+type ChainReport struct {
+	Path    []PathStep  `json:"path"`
+	Valid   bool        `json:"valid"`
+	Unknown bool        `json:"unknown,omitempty"`
+	Reason  string      `json:"reason,omitempty"`
+	Checks  []PathCheck `json:"checks"`
+}
+
 type VerifyResult struct {
 	EvidenceID   int           `json:"evidenceId"`
 	RulesVersion int           `json:"rulesVersion"`
@@ -37,25 +51,13 @@ type VerifyResult struct {
 	Purpose      string        `json:"purpose"`
 	CheckedAt    time.Time     `json:"checkedAt"`
 	Valid        bool          `json:"valid"`
+	Unknown      bool          `json:"unknown,omitempty"`
 	Reason       string        `json:"reason,omitempty"`
 	SelectedPath []string      `json:"selectedPath,omitempty"`
 	Chains       []ChainReport `json:"chains"`
 	TrustedRoots []string      `json:"trustedRoots"`
 }
 
-// Verify performs a live verification of leafID for the requested purpose
-// (serverAuth/clientAuth), appends an immutable evidence record and returns
-// it. It evaluates every candidate trust path for:
-//   - cryptographic signatures (stdlib x509 chain building),
-//   - purpose (ExtKeyUsage on the leaf),
-//   - validity period of every certificate in the path,
-//   - trust anchor (only currently trusted roots),
-//   - revocation, re-read from live state and a freshly generated CRL.
-//
-// A single correct signature can never make the result valid: the whole
-// chain must satisfy every check. Cross-signed intermediates surface as
-// multiple candidate paths (old chain and new chain); expired or broken
-// paths are still shown with the reason they failed.
 func (l *Lab) Verify(leafID string, purpose EKU) (*VerifyResult, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -68,32 +70,30 @@ func (l *Lab) Verify(leafID string, purpose EKU) (*VerifyResult, error) {
 	if leaf.Kind != KindLeaf {
 		return nil, fmt.Errorf("%q is not a leaf certificate", leafID)
 	}
-
-	wantEKU, ok := map[EKU]x509.ExtKeyUsage{
-		EKUServer: x509.ExtKeyUsageServerAuth,
-		EKUClient: x509.ExtKeyUsageClientAuth,
-	}[purpose]
-	if !ok {
+	wantEKU := x509.ExtKeyUsageAny
+	switch purpose {
+	case EKUServer:
+		wantEKU = x509.ExtKeyUsageServerAuth
+	case EKUClient:
+		wantEKU = x509.ExtKeyUsageClientAuth
+	default:
 		return nil, fmt.Errorf("unknown purpose %q", purpose)
 	}
 
-	res := &VerifyResult{
-		RulesVersion: l.rulesVersion, LeafID: leafID, Purpose: string(purpose),
-		CheckedAt: now.UTC(),
-	}
+	res := &VerifyResult{RulesVersion: l.rulesVersion, LeafID: leafID, Purpose: string(purpose), CheckedAt: now.UTC()}
 	for id := range l.trust {
 		if l.trust[id] {
 			res.TrustedRoots = append(res.TrustedRoots, id)
 		}
 	}
 
-	// Enumerate every cryptographic path from the leaf to a self-signed root.
 	var chains [][]*Cert
 	l.enumerate(leaf, map[string]bool{}, nil, &chains)
+	hasDeterministicFailure := false
+	hasUnknownPath := false
 
 	for _, chain := range chains {
-		report := ChainReport{Valid: true}
-		// chain order: leaf ... root; present root-first.
+		report := ChainReport{}
 		for i := len(chain) - 1; i >= 0; i-- {
 			c := chain[i]
 			step := PathStep{
@@ -109,19 +109,27 @@ func (l *Lab) Verify(leafID string, purpose EKU) (*VerifyResult, error) {
 			report.Path = append(report.Path, step)
 		}
 
-		if reason := l.evaluateChain(chain, wantEKU, now); reason != "" {
-			report.Valid = false
-			report.Reason = reason
-		}
-		res.Chains = append(res.Chains, report)
-		if report.Valid && !res.Valid {
+		reason, unknown, checks := l.evaluateChainLocked(chain, wantEKU, now)
+		report.Checks = checks
+		if reason == "" {
+			report.Valid = true
 			res.Valid = true
 			res.SelectedPath = idsOf(chain)
+		} else {
+			report.Reason = reason
+			report.Unknown = unknown
+			if unknown {
+				hasUnknownPath = true
+			} else {
+				hasDeterministicFailure = true
+			}
 		}
+		res.Chains = append(res.Chains, report)
 	}
 
 	if !res.Valid {
 		res.Reason = summarize(res.Chains)
+		res.Unknown = hasUnknownPath && !hasDeterministicFailure
 	}
 	l.history = append(l.history, res)
 	res.EvidenceID = len(l.history)
@@ -129,7 +137,6 @@ func (l *Lab) Verify(leafID string, purpose EKU) (*VerifyResult, error) {
 }
 
 func idsOf(chain []*Cert) []string {
-	// root-first order
 	ids := make([]string, 0, len(chain))
 	for i := len(chain) - 1; i >= 0; i-- {
 		ids = append(ids, chain[i].ID)
@@ -143,112 +150,160 @@ func summarize(reports []ChainReport) string {
 	}
 	seen := map[string]bool{}
 	var reasons []string
-	for _, r := range reports {
-		if !r.Valid && !seen[r.Reason] {
-			seen[r.Reason] = true
-			reasons = append(reasons, r.Reason)
+	for _, report := range reports {
+		if !report.Valid && !seen[report.Reason] {
+			seen[report.Reason] = true
+			reasons = append(reasons, report.Reason)
 		}
 	}
 	return strings.Join(reasons, "; ")
 }
 
-func (l *Lab) evaluateChain(chain []*Cert, wantEKU x509.ExtKeyUsage, now time.Time) string {
+func (l *Lab) evaluateChainLocked(chain []*Cert, wantEKU x509.ExtKeyUsage, now time.Time) (string, bool, []PathCheck) {
 	leaf := chain[0]
+	var checks []PathCheck
+	var failures, unknowns []string
+	failed := false
+	fail := func(name, detail string) {
+		failed = true
+		if !contains(failures, detail) {
+			failures = append(failures, detail)
+		}
+		checks = append(checks, PathCheck{Name: name, Status: CheckFail, Detail: detail})
+	}
+	unknown := func(name, detail string) {
+		if !contains(unknowns, detail) {
+			unknowns = append(unknowns, detail)
+		}
+		checks = append(checks, PathCheck{Name: name, Status: CheckUnknown, Detail: detail})
+	}
+	pass := func(name, detail string) {
+		checks = append(checks, PathCheck{Name: name, Status: CheckPass, Detail: detail})
+	}
 
 	hasPurpose := false
-	for _, u := range leaf.Cert.ExtKeyUsage {
-		if u == wantEKU {
+	for _, usage := range leaf.Cert.ExtKeyUsage {
+		if usage == wantEKU {
 			hasPurpose = true
 		}
 	}
-	if !hasPurpose {
-		return "purpose not permitted by certificate ExtKeyUsage"
+	if hasPurpose {
+		pass("证书用途", "终端证书允许所请求的 ExtKeyUsage")
+	} else {
+		fail("证书用途", "purpose not permitted by certificate ExtKeyUsage")
 	}
 
-	// Validity period, revocation state and CA basic constraints for every
-	// certificate in the path. Checking these first makes the failure reason
-	// precise instead of hiding it behind a generic stdlib verify error.
 	for _, c := range chain {
-		if now.Before(c.Cert.NotBefore) {
-			return fmt.Sprintf("certificate %q not yet valid", c.Label)
-		}
-		if now.After(c.Cert.NotAfter) {
-			return fmt.Sprintf("certificate %q expired", c.Label)
-		}
-		if c.Revoked {
-			return fmt.Sprintf("certificate %q revoked", c.Label)
+		name := fmt.Sprintf("期限：%s", c.Label)
+		switch {
+		case now.Before(c.Cert.NotBefore):
+			fail(name, fmt.Sprintf("certificate %q not yet valid until %s", c.Label, c.Cert.NotBefore.Format(time.RFC3339)))
+		case now.After(c.Cert.NotAfter):
+			fail(name, fmt.Sprintf("certificate %q expired at %s; checked at %s", c.Label, c.Cert.NotAfter.Format(time.RFC3339), now.Format(time.RFC3339)))
+		default:
+			pass(name, "实验时刻处于证书 NotBefore/NotAfter 有效期内")
 		}
 		if c != leaf && !c.Cert.IsCA {
-			return fmt.Sprintf("certificate %q is not a CA", c.Label)
+			fail(fmt.Sprintf("CA 基本约束：%s", c.Label), fmt.Sprintf("certificate %q is not a CA", c.Label))
+		}
+	}
+
+	for _, c := range chain {
+		name := fmt.Sprintf("本地撤销标记：%s", c.Label)
+		if c.Revoked {
+			fail(name, fmt.Sprintf("certificate %q revoked at %s", c.Label, c.RevokedAt.Format(time.RFC3339)))
+		} else {
+			pass(name, "验证时实验状态未把该证书标记为撤销")
 		}
 	}
 
 	root := chain[len(chain)-1]
-	if root.Kind != KindRoot || root.Cert.Subject.String() != root.Cert.Issuer.String() {
-		return "chain does not end at a self-signed root"
-	}
-	if !l.trust[root.ID] {
-		return fmt.Sprintf("root %q is not a trusted anchor", root.Label)
-	}
-
-	// Cryptographic confirmation of the whole path via the standard library.
-	// A correct signature on one certificate does not help if another hop is
-	// missing: this verifies the complete leaf->root chain.
-	roots := x509.NewCertPool()
-	roots.AddCert(root.Cert)
-	intermediates := x509.NewCertPool()
-	for _, c := range chain[1 : len(chain)-1] {
-		intermediates.AddCert(c.Cert)
-	}
-	if _, err := leaf.Cert.Verify(x509.VerifyOptions{
-		Roots:         roots,
-		Intermediates: intermediates,
-		CurrentTime:   now,
-		KeyUsages:     []x509.ExtKeyUsage{wantEKU},
-	}); err != nil {
-		return "chain verification failed: " + err.Error()
+	if root.Kind == KindRoot && root.Cert.Subject.String() == root.Cert.Issuer.String() {
+		if l.trust[root.ID] {
+			pass("信任锚点", root.ID+" 在规则 v"+fmt.Sprint(l.rulesVersion)+" 的信任根集合中")
+		} else {
+			fail("信任锚点", fmt.Sprintf("root %q is not a trusted anchor", root.Label))
+		}
+	} else {
+		fail("信任锚点", "chain does not end at a self-signed root")
 	}
 
-	// Freshly generated revocation data for every issuing CA. Missing CRL
-	// publication, stale CRLs, bad CRL signatures or listed serials all fail
-	// the path. Each CA's CRL is consulted under that CA's own logical node,
-	// so a cross certificate's missing publication flag cannot mask the
-	// original CA's CRL.
+	if failed {
+		checks = append(checks, PathCheck{Name: "完整密码学路径", Status: CheckSkipped, Detail: "确定性检查已失败，跳过完整链验证"})
+	} else {
+		roots := x509.NewCertPool()
+		roots.AddCert(root.Cert)
+		intermediates := x509.NewCertPool()
+		for _, c := range chain[1 : len(chain)-1] {
+			intermediates.AddCert(c.Cert)
+		}
+		if _, err := leaf.Cert.Verify(x509.VerifyOptions{
+			Roots: roots, Intermediates: intermediates, CurrentTime: now,
+			KeyUsages: []x509.ExtKeyUsage{wantEKU},
+		}); err != nil {
+			fail("完整密码学路径", "chain verification failed: "+err.Error())
+		} else {
+			pass("完整密码学路径", "x509.Certificate.Verify 已确认完整 leaf-to-root 签名链")
+		}
+	}
+
 	for _, issuerNode := range chain[1:] {
 		ca := l.canonicalIssuerLocked(issuerNode)
+		name := fmt.Sprintf("CRL：%s", issuerNode.Label)
 		if !issuerNode.CRLPublished || !ca.CRLPublished {
-			return fmt.Sprintf("revocation data missing for CA %q", issuerNode.Label)
+			unknown(name, fmt.Sprintf("revocation data missing for CA %q; revocation status cannot be determined", issuerNode.Label))
+			continue
 		}
 		der, err := l.buildCRLLocked(ca)
 		if err != nil {
-			return "CRL unavailable for " + issuerNode.Label + ": " + err.Error()
+			unknown(name, "CRL unavailable for "+issuerNode.Label+": "+err.Error())
+			continue
 		}
 		crl, err := x509.ParseRevocationList(der)
 		if err != nil {
-			return "invalid CRL from " + issuerNode.Label
+			fail(name, "invalid CRL from "+issuerNode.Label)
+			continue
 		}
 		if err := crl.CheckSignatureFrom(ca.Cert); err != nil {
-			return "CRL signature invalid for " + issuerNode.Label
+			fail(name, "CRL signature invalid for "+issuerNode.Label)
+			continue
 		}
 		if now.Before(crl.ThisUpdate) || now.After(crl.NextUpdate) {
-			return "stale CRL from " + issuerNode.Label
+			unknown(name, "stale CRL from "+issuerNode.Label+"; revocation status cannot be determined at the check time")
+			continue
 		}
-		for _, entry := range crl.RevokedCertificateEntries {
-			for _, c := range chain {
+		listed := false
+		for _, c := range chain {
+			for _, entry := range crl.RevokedCertificateEntries {
 				if c.Cert.SerialNumber.Cmp(entry.SerialNumber) == 0 {
-					return fmt.Sprintf("certificate %q listed on CRL of %q", c.Label, ca.Label)
+					fail(name, fmt.Sprintf("certificate %q listed on CRL of %q", c.Label, ca.Label))
+					listed = true
 				}
 			}
 		}
+		if !listed {
+			pass(name, "实时 CRL 签名和时效有效，链上序列号均未列入撤销名单")
+		}
 	}
-	return ""
+
+	if failed {
+		return strings.Join(failures, "; "), false, checks
+	}
+	if len(unknowns) > 0 {
+		return strings.Join(unknowns, "; "), true, checks
+	}
+	return "", false, checks
 }
 
-// enumerate DFS-walks all parents that cryptographically signed the current
-// certificate. A cross certificate shares subject DN and public key with the
-// original intermediate, so both appear as candidate parents, producing the
-// old-root and new-root paths during migration. Each branch gets its own
-// visited set so sibling paths do not mask one another.
+func contains(items []string, value string) bool {
+	for _, item := range items {
+		if item == value {
+			return true
+		}
+	}
+	return false
+}
+
 func (l *Lab) enumerate(cur *Cert, visited map[string]bool, acc []*Cert, out *[][]*Cert) {
 	acc = append(append([]*Cert{}, acc...), cur)
 	visited[cur.ID] = true
@@ -264,16 +319,14 @@ func (l *Lab) enumerate(cur *Cert, visited map[string]bool, acc []*Cert, out *[]
 		}
 		if err := cur.Cert.CheckSignatureFrom(parent.Cert); err == nil {
 			next := map[string]bool{}
-			for k, v := range visited {
-				next[k] = v
+			for id, ok := range visited {
+				next[id] = ok
 			}
 			extended = true
 			l.enumerate(parent, next, acc, out)
 		}
 	}
 	if !extended {
-		// Dead end: still report the partial path so expired/broken paths are
-		// visible in the UI.
 		*out = append(*out, acc)
 	}
 }

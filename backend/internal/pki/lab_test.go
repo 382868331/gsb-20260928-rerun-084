@@ -98,10 +98,42 @@ func TestMissingCRLFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	if res.Valid {
-		t.Fatal("path with missing revocation data must not validate")
+		t.Fatal("path with missing revocation data must not be reported as valid")
 	}
-	if !strings.Contains(strings.ToLower(res.Reason), "revocation data missing") {
-		t.Fatalf("expected missing revocation data reason, got %q", res.Reason)
+	if !res.Unknown {
+		t.Fatal("missing CRL must be reported as unknown rather than deterministic revocation failure")
+	}
+	if !strings.Contains(strings.ToLower(res.Reason), "cannot be determined") {
+		t.Fatalf("expected undetermined revocation reason, got %q", res.Reason)
+	}
+}
+
+func TestRestoringRevocationDataDoesNotRewriteEvidence(t *testing.T) {
+	l := freshSampleLab(t)
+	before, err := l.Verify("leaf-nocrl", EKUServer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Valid || !before.Unknown {
+		t.Fatalf("initial result should be undetermined, valid=%v unknown=%v", before.Valid, before.Unknown)
+	}
+	if err := l.SetCRLPublished("silent-im", true); err != nil {
+		t.Fatal(err)
+	}
+	after, err := l.Verify("leaf-nocrl", EKUServer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.Valid {
+		t.Fatalf("after CRL publication is restored, path should validate: %s", after.Reason)
+	}
+	hist := l.History()
+	older := hist[1]
+	if older.Valid || !older.Unknown {
+		t.Fatalf("old evidence was rewritten: valid=%v unknown=%v", older.Valid, older.Unknown)
+	}
+	if older.Chains[0].Path[1].CRLPublished {
+		t.Fatal("old path snapshot must retain missing-CRL state")
 	}
 }
 

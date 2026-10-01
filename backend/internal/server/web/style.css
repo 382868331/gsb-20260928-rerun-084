@@ -85,12 +85,23 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; }
 .verdict { font-size: 15px; font-weight: 700; margin-bottom: 6px; }
 .verdict.ok { color: var(--ok); }
 .verdict.bad { color: var(--bad); }
+.verdict.unknown { color: var(--warn); }
 .chain { border-left: 3px solid var(--line); margin: 10px 0; padding: 8px 12px; background: #141c30; border-radius: 0 8px 8px 0; }
 .chain.ok { border-left-color: var(--ok); }
 .chain.bad { border-left-color: var(--bad); }
+.chain.unknown { border-left-color: var(--warn); }
 .step { padding: 3px 0; }
 .step small { color: var(--muted); }
 .arrow { color: var(--muted); padding-left: 12px; }
+
+.checks { margin: 8px 0 4px 18px; padding: 0; list-style: none; }
+.checks li { padding: 3px 0; border-top: 1px dashed var(--line); }
+.checks small { display: block; color: var(--muted); }
+.comparison { margin: 10px 0; padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: #111a2e; }
+.comparison h4 { margin: 0 0 6px; color: var(--warn); }
+.compare-row { display: flex; justify-content: space-between; gap: 12px; padding: 4px 0; border-top: 1px dashed var(--line); }
+.replay-banner { margin-bottom: 10px; padding: 8px 10px; border: 1px solid var(--warn); border-radius: 8px; color: #ffe7ad; }
+.replay-banner button { margin-left: 10px; }
 
 .history { display: flex; flex-direction: column; gap: 10px; }
 .evidence { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; background: #121a2c; }
