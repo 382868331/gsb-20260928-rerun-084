@@ -43,6 +43,10 @@ type Cert struct {
 	// CRLPublished reports whether this CA node publishes revocation data.
 	// False models missing CRL information for an otherwise valid CA.
 	CRLPublished bool
+	// CRLDelayMin shifts the CRL ThisUpdate into the future, modelling
+	// revocation material that is published but not yet effective
+	// ("late" revocation data).
+	CRLDelayMin int
 }
 
 // EncodePEM renders a DER certificate as PEM text.
@@ -68,6 +72,7 @@ type PublicView struct {
 	Revoked      bool       `json:"revoked"`
 	RevokedAt    *time.Time `json:"revokedAt,omitempty"`
 	CRLPublished bool       `json:"crlPublished"`
+	CRLDelayMin  int        `json:"crlDelayMin,omitempty"`
 	PEM          string     `json:"pem"`
 }
 
@@ -107,5 +112,6 @@ func (c *Cert) View() PublicView {
 		v.RevokedAt = &t
 	}
 	v.CRLPublished = c.CRLPublished
+	v.CRLDelayMin = c.CRLDelayMin
 	return v
 }

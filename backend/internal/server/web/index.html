@@ -85,6 +85,12 @@
         </select>
         <button>重新验证（保留旧证据）</button>
       </form>
+      <form id="policyForm" class="inline policy">
+        <input name="allowedRoots" placeholder="允许的根（逗号分隔，空=全部受信根）" />
+        <input name="preferredRoots" placeholder="根优先顺序（逗号分隔）" />
+        <label class="check"><input type="checkbox" name="requireCrl" /> 必须具备完整撤销资料</label>
+        <span class="hint">以上偏好仅作用于下一次验证，并随证据保存，便于比较选择变化。</span>
+      </form>
       <div id="verifyResult" class="result"></div>
     </section>
 

@@ -277,6 +277,30 @@ func (l *Lab) SetCRLPublished(caID string, published bool) error {
 	return nil
 }
 
+// SetCRLDelay models revocation material that arrives late: the CA keeps
+// publishing a CRL, but its ThisUpdate sits the given minutes in the
+// future, so verifications before that moment cannot yet rely on it.
+// Changing the delay is a rules change and bumps the rules version.
+func (l *Lab) SetCRLDelay(caID string, minutes int) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	c, ok := l.certs[caID]
+	if !ok {
+		return fmt.Errorf("cert %q not found", caID)
+	}
+	if c.Kind == KindLeaf {
+		return fmt.Errorf("leaf %q cannot publish a CRL", caID)
+	}
+	if minutes < 0 {
+		minutes = 0
+	}
+	if c.CRLDelayMin != minutes {
+		c.CRLDelayMin = minutes
+		l.rulesVersion++
+	}
+	return nil
+}
+
 // CRL renders a fresh X.509 CRL for a CA node containing every currently
 // revoked certificate that the CA issued. It is generated on demand, so it
 // can never serve stale revocation data.
@@ -306,7 +330,7 @@ func (l *Lab) buildCRLLocked(ca *Cert) ([]byte, error) {
 	}
 	tmpl := &x509.RevocationList{
 		Number:                    new(big.Int).SetUint64(l.seq.Add(1)),
-		ThisUpdate:                now.Add(-time.Minute),
+		ThisUpdate:                now.Add(-time.Minute).Add(time.Duration(ca.CRLDelayMin) * time.Minute),
 		NextUpdate:                now.Add(time.Hour),
 		RevokedCertificateEntries: entries,
 	}

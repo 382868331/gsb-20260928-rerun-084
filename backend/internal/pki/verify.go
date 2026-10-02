@@ -7,6 +7,67 @@ import (
 	"time"
 )
 
+// ChainStatus is the tri-state verdict of one candidate path.
+type ChainStatus string
+
+const (
+	// StatusValid: every check passed; the path can be adopted.
+	StatusValid ChainStatus = "valid"
+	// StatusDisqualified: a definitive failure (expiry, revocation, wrong
+	// purpose, untrusted or out-of-scope root, broken signature, CRL hit).
+	StatusDisqualified ChainStatus = "disqualified"
+	// StatusUndetermined: not provably bad, but evidence is missing (no
+	// CRL published, or revocation data not yet valid / stale).
+	StatusUndetermined ChainStatus = "undetermined"
+)
+
+// Policy captures the per-experiment selection preferences and mandatory
+// conditions. It is stored inside each evidence record so a later review
+// shows exactly which rules basis produced the selection.
+type Policy struct {
+	// AllowedRoots restricts acceptable trust anchors for this experiment.
+	// Empty means every currently trusted root is acceptable.
+	AllowedRoots []string `json:"allowedRoots,omitempty"`
+	// PreferredRoots orders root IDs by preference; among valid paths the
+	// one ending at the earliest listed root is adopted.
+	PreferredRoots []string `json:"preferredRoots,omitempty"`
+	// RequireCRL makes complete revocation data mandatory: paths with
+	// missing or not-yet-valid CRLs become disqualified instead of
+	// undetermined.
+	RequireCRL bool `json:"requireCrl,omitempty"`
+}
+
+func (p *Policy) normalized() *Policy {
+	if p == nil {
+		return &Policy{}
+	}
+	out := &Policy{RequireCRL: p.RequireCRL}
+	out.AllowedRoots = append(out.AllowedRoots, p.AllowedRoots...)
+	out.PreferredRoots = append(out.PreferredRoots, p.PreferredRoots...)
+	return out
+}
+
+func (p *Policy) rootAllowed(id string) bool {
+	if len(p.AllowedRoots) == 0 {
+		return true
+	}
+	for _, r := range p.AllowedRoots {
+		if r == id {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *Policy) rootRank(id string) int {
+	for i, r := range p.PreferredRoots {
+		if r == id {
+			return i
+		}
+	}
+	return len(p.PreferredRoots)
+}
+
 // PathStep describes one node of a candidate verification path.
 type PathStep struct {
 	ID           string    `json:"id"`
@@ -24,9 +85,10 @@ type PathStep struct {
 
 // ChainReport is one attempted root-to-leaf path with its evaluation.
 type ChainReport struct {
-	Path   []PathStep `json:"path"`
-	Valid  bool       `json:"valid"`
-	Reason string     `json:"reason,omitempty"`
+	Path   []PathStep  `json:"path"`
+	Valid  bool        `json:"valid"`
+	Status ChainStatus `json:"status"`
+	Reason string      `json:"reason,omitempty"`
 }
 
 // VerifyResult is one immutable verification answer.
@@ -35,8 +97,10 @@ type VerifyResult struct {
 	RulesVersion int           `json:"rulesVersion"`
 	LeafID       string        `json:"leafId"`
 	Purpose      string        `json:"purpose"`
+	Policy       *Policy       `json:"policy"`
 	CheckedAt    time.Time     `json:"checkedAt"`
 	Valid        bool          `json:"valid"`
+	Status       ChainStatus   `json:"status"`
 	Reason       string        `json:"reason,omitempty"`
 	SelectedPath []string      `json:"selectedPath,omitempty"`
 	Chains       []ChainReport `json:"chains"`
@@ -56,10 +120,11 @@ type VerifyResult struct {
 // chain must satisfy every check. Cross-signed intermediates surface as
 // multiple candidate paths (old chain and new chain); expired or broken
 // paths are still shown with the reason they failed.
-func (l *Lab) Verify(leafID string, purpose EKU) (*VerifyResult, error) {
+func (l *Lab) Verify(leafID string, purpose EKU, policy *Policy) (*VerifyResult, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	pol := policy.normalized()
 	now := l.nowFunc()
 	leaf, ok := l.certs[leafID]
 	if !ok {
@@ -79,7 +144,7 @@ func (l *Lab) Verify(leafID string, purpose EKU) (*VerifyResult, error) {
 
 	res := &VerifyResult{
 		RulesVersion: l.rulesVersion, LeafID: leafID, Purpose: string(purpose),
-		CheckedAt: now.UTC(),
+		CheckedAt: now.UTC(), Policy: pol,
 	}
 	for id := range l.trust {
 		if l.trust[id] {
@@ -92,7 +157,7 @@ func (l *Lab) Verify(leafID string, purpose EKU) (*VerifyResult, error) {
 	l.enumerate(leaf, map[string]bool{}, nil, &chains)
 
 	for _, chain := range chains {
-		report := ChainReport{Valid: true}
+		report := ChainReport{Status: StatusValid}
 		// chain order: leaf ... root; present root-first.
 		for i := len(chain) - 1; i >= 0; i-- {
 			c := chain[i]
@@ -109,18 +174,41 @@ func (l *Lab) Verify(leafID string, purpose EKU) (*VerifyResult, error) {
 			report.Path = append(report.Path, step)
 		}
 
-		if reason := l.evaluateChain(chain, wantEKU, now); reason != "" {
-			report.Valid = false
+		if status, reason := l.evaluateChain(chain, wantEKU, now, pol); status != StatusValid {
+			report.Status = status
 			report.Reason = reason
 		}
+		report.Valid = report.Status == StatusValid
 		res.Chains = append(res.Chains, report)
-		if report.Valid && !res.Valid {
-			res.Valid = true
-			res.SelectedPath = idsOf(chain)
-		}
 	}
 
-	if !res.Valid {
+	// Adopt the valid path whose root ranks best under the experiment's
+	// preferred-roots list (ties keep enumeration order).
+	best := -1
+	for i := range res.Chains {
+		if res.Chains[i].Status != StatusValid {
+			continue
+		}
+		if best == -1 || pol.rootRank(res.Chains[i].Path[0].ID) < pol.rootRank(res.Chains[best].Path[0].ID) {
+			best = i
+		}
+	}
+	if best >= 0 {
+		res.Valid = true
+		res.Status = StatusValid
+		res.SelectedPath = idsOfPath(res.Chains[best].Path)
+	} else {
+		undetermined := false
+		for _, ch := range res.Chains {
+			if ch.Status == StatusUndetermined {
+				undetermined = true
+			}
+		}
+		if undetermined {
+			res.Status = StatusUndetermined
+		} else {
+			res.Status = StatusDisqualified
+		}
 		res.Reason = summarize(res.Chains)
 	}
 	l.history = append(l.history, res)
@@ -128,11 +216,10 @@ func (l *Lab) Verify(leafID string, purpose EKU) (*VerifyResult, error) {
 	return res, nil
 }
 
-func idsOf(chain []*Cert) []string {
-	// root-first order
-	ids := make([]string, 0, len(chain))
-	for i := len(chain) - 1; i >= 0; i-- {
-		ids = append(ids, chain[i].ID)
+func idsOfPath(path []PathStep) []string {
+	ids := make([]string, 0, len(path))
+	for _, s := range path {
+		ids = append(ids, s.ID)
 	}
 	return ids
 }
@@ -144,15 +231,23 @@ func summarize(reports []ChainReport) string {
 	seen := map[string]bool{}
 	var reasons []string
 	for _, r := range reports {
-		if !r.Valid && !seen[r.Reason] {
+		if r.Status != StatusValid && !seen[r.Reason] {
 			seen[r.Reason] = true
-			reasons = append(reasons, r.Reason)
+			prefix := "disqualified: "
+			if r.Status == StatusUndetermined {
+				prefix = "undetermined: "
+			}
+			reasons = append(reasons, prefix+r.Reason)
 		}
 	}
 	return strings.Join(reasons, "; ")
 }
 
-func (l *Lab) evaluateChain(chain []*Cert, wantEKU x509.ExtKeyUsage, now time.Time) string {
+// evaluateChain returns the tri-state verdict of one candidate path. Hard
+// failures (expiry, revocation, purpose, anchor, signatures, CRL hits) are
+// disqualified; missing or not-yet-effective revocation data only makes the
+// path undetermined unless the experiment policy requires complete CRLs.
+func (l *Lab) evaluateChain(chain []*Cert, wantEKU x509.ExtKeyUsage, now time.Time, pol *Policy) (ChainStatus, string) {
 	leaf := chain[0]
 
 	hasPurpose := false
@@ -162,7 +257,7 @@ func (l *Lab) evaluateChain(chain []*Cert, wantEKU x509.ExtKeyUsage, now time.Ti
 		}
 	}
 	if !hasPurpose {
-		return "purpose not permitted by certificate ExtKeyUsage"
+		return StatusDisqualified, "purpose not permitted by certificate ExtKeyUsage"
 	}
 
 	// Validity period, revocation state and CA basic constraints for every
@@ -170,25 +265,28 @@ func (l *Lab) evaluateChain(chain []*Cert, wantEKU x509.ExtKeyUsage, now time.Ti
 	// precise instead of hiding it behind a generic stdlib verify error.
 	for _, c := range chain {
 		if now.Before(c.Cert.NotBefore) {
-			return fmt.Sprintf("certificate %q not yet valid", c.Label)
+			return StatusDisqualified, fmt.Sprintf("certificate %q not yet valid", c.Label)
 		}
 		if now.After(c.Cert.NotAfter) {
-			return fmt.Sprintf("certificate %q expired", c.Label)
+			return StatusDisqualified, fmt.Sprintf("certificate %q expired", c.Label)
 		}
 		if c.Revoked {
-			return fmt.Sprintf("certificate %q revoked", c.Label)
+			return StatusDisqualified, fmt.Sprintf("certificate %q revoked", c.Label)
 		}
 		if c != leaf && !c.Cert.IsCA {
-			return fmt.Sprintf("certificate %q is not a CA", c.Label)
+			return StatusDisqualified, fmt.Sprintf("certificate %q is not a CA", c.Label)
 		}
 	}
 
 	root := chain[len(chain)-1]
 	if root.Kind != KindRoot || root.Cert.Subject.String() != root.Cert.Issuer.String() {
-		return "chain does not end at a self-signed root"
+		return StatusDisqualified, "chain does not end at a self-signed root"
 	}
 	if !l.trust[root.ID] {
-		return fmt.Sprintf("root %q is not a trusted anchor", root.Label)
+		return StatusDisqualified, fmt.Sprintf("root %q is not a trusted anchor", root.Label)
+	}
+	if !pol.rootAllowed(root.ID) {
+		return StatusDisqualified, fmt.Sprintf("root %q is outside this experiment's allowed roots", root.Label)
 	}
 
 	// Cryptographic confirmation of the whole path via the standard library.
@@ -206,42 +304,54 @@ func (l *Lab) evaluateChain(chain []*Cert, wantEKU x509.ExtKeyUsage, now time.Ti
 		CurrentTime:   now,
 		KeyUsages:     []x509.ExtKeyUsage{wantEKU},
 	}); err != nil {
-		return "chain verification failed: " + err.Error()
+		return StatusDisqualified, "chain verification failed: " + err.Error()
 	}
 
-	// Freshly generated revocation data for every issuing CA. Missing CRL
-	// publication, stale CRLs, bad CRL signatures or listed serials all fail
-	// the path. Each CA's CRL is consulted under that CA's own logical node,
-	// so a cross certificate's missing publication flag cannot mask the
-	// original CA's CRL.
+	// Freshly generated revocation data for every issuing CA. Missing,
+	// delayed or stale revocation data makes the path undetermined (or
+	// disqualified when the policy mandates complete CRLs); a CRL that
+	// lists a path certificate is a definitive disqualification. Each CA's
+	// CRL is consulted under that CA's own logical node, so a cross
+	// certificate's missing publication flag cannot mask the original
+	// CA's CRL.
 	for _, issuerNode := range chain[1:] {
 		ca := l.canonicalIssuerLocked(issuerNode)
 		if !issuerNode.CRLPublished || !ca.CRLPublished {
-			return fmt.Sprintf("revocation data missing for CA %q", issuerNode.Label)
+			return missingCRLVerdict(pol, fmt.Sprintf("revocation data missing for CA %q", issuerNode.Label))
 		}
 		der, err := l.buildCRLLocked(ca)
 		if err != nil {
-			return "CRL unavailable for " + issuerNode.Label + ": " + err.Error()
+			return missingCRLVerdict(pol, "CRL unavailable for "+issuerNode.Label+": "+err.Error())
 		}
 		crl, err := x509.ParseRevocationList(der)
 		if err != nil {
-			return "invalid CRL from " + issuerNode.Label
+			return StatusDisqualified, "invalid CRL from " + issuerNode.Label
 		}
 		if err := crl.CheckSignatureFrom(ca.Cert); err != nil {
-			return "CRL signature invalid for " + issuerNode.Label
+			return StatusDisqualified, "CRL signature invalid for " + issuerNode.Label
 		}
-		if now.Before(crl.ThisUpdate) || now.After(crl.NextUpdate) {
-			return "stale CRL from " + issuerNode.Label
+		if now.Before(crl.ThisUpdate) {
+			return missingCRLVerdict(pol, fmt.Sprintf("revocation data for CA %q not yet effective (late CRL)", issuerNode.Label))
+		}
+		if now.After(crl.NextUpdate) {
+			return missingCRLVerdict(pol, "stale CRL from "+issuerNode.Label)
 		}
 		for _, entry := range crl.RevokedCertificateEntries {
 			for _, c := range chain {
 				if c.Cert.SerialNumber.Cmp(entry.SerialNumber) == 0 {
-					return fmt.Sprintf("certificate %q listed on CRL of %q", c.Label, ca.Label)
+					return StatusDisqualified, fmt.Sprintf("certificate %q listed on CRL of %q", c.Label, ca.Label)
 				}
 			}
 		}
 	}
-	return ""
+	return StatusValid, ""
+}
+
+func missingCRLVerdict(pol *Policy, reason string) (ChainStatus, string) {
+	if pol.RequireCRL {
+		return StatusDisqualified, reason + " (policy requires complete revocation data)"
+	}
+	return StatusUndetermined, reason
 }
 
 // enumerate DFS-walks all parents that cryptographically signed the current

@@ -55,6 +55,7 @@ function renderRows(state) {
     if (now < new Date(c.notBefore) || now > new Date(c.notAfter)) status.push(`<span class="bad-text">已过期/未生效</span>`);
     if (c.revoked) status.push(`<span class="bad-text">已撤销 ${fmtDate(c.revokedAt)}</span>`);
     if (c.kind !== "leaf" && !c.crlPublished) status.push(`<span class="warn-text">撤销资料缺失</span>`);
+    if (c.kind !== "leaf" && c.crlDelayMin > 0) status.push(`<span class="warn-text">撤销资料迟到 ${c.crlDelayMin} 分钟</span>`);
 
     const actions = [`<button class="small danger" data-act="revoke" data-id="${c.id}">撤销</button>`];
     if (c.kind === "root") {
@@ -67,6 +68,7 @@ function renderRows(state) {
         ? `<button class="small warn" data-act="crlOff" data-id="${c.id}">停止发布 CRL</button>`
         : `<button class="small" data-act="crlOn" data-id="${c.id}">恢复发布 CRL</button>`);
       actions.push(`<a class="small" href="/api/crl/${c.id}" target="_blank"><button class="small ghost">下载 CRL</button></a>`);
+      actions.push(`<button class="small ghost" data-act="crlDelay" data-id="${c.id}">迟到 CRL</button>`);
     }
 
     tr.innerHTML = `
@@ -105,17 +107,33 @@ function pathArrow(step, isFirst) {
 }
 
 function renderResult(res, target) {
+  const statusText = { valid: "✓ 验证通过", undetermined: "? 尚缺依据（无法确定）", disqualified: "✗ 验证失败" };
+  const verdictClass = res.status === "valid" ? "ok" : res.status === "undetermined" ? "warn" : "bad";
+  const pol = res.policy || {};
+  const polBits = [];
+  if ((pol.allowedRoots || []).length) polBits.push("允许的根：" + pol.allowedRoots.join(", "));
+  if ((pol.preferredRoots || []).length) polBits.push("根优先：" + pol.preferredRoots.join(" > "));
+  if (pol.requireCrl) polBits.push("必须具备完整撤销资料");
+  const selected = (res.selectedPath || []).join(" → ");
   target.innerHTML = `
-    <div class="verdict ${res.valid ? "ok" : "bad"}">` +
-      `${res.valid ? "✓ 验证通过" : "✗ 验证失败"} · 证书 ${res.leafId} · 用途 ${res.purpose} · 证据 #${res.evidenceId} · 规则版本 ${res.rulesVersion}</div>
-    <div class="muted">${res.valid ? "实际采用路径：" + (res.selectedPath || []).join(" → ") : "失败原因：" + (res.reason || "-")}</div>
+    <div class="verdict ${verdictClass}">` +
+      `${statusText[res.status] || (res.valid ? statusText.valid : statusText.disqualified)} · 证书 ${res.leafId} · 用途 ${res.purpose} · 证据 #${res.evidenceId} · 规则版本 ${res.rulesVersion}</div>
+    <div class="muted">${res.valid ? "实际采用路径：" + selected : "结论依据：" + (res.reason || "-")}</div>
     <div class="muted">受信任根：${(res.trustedRoots || []).join(", ") || "（无）"} · 检查时间 ${fmtDate(res.checkedAt)}</div>
+    ${polBits.length ? `<div class="muted">本次实验策略：${polBits.join(" · ")}</div>` : ""}
     ${(res.chains || []).map(ch => `
-      <div class="chain ${ch.valid ? "ok" : "bad"}">
-        <b>${ch.valid ? "可用路径" : "无效路径"}</b>
-        ${ch.reason ? ` <span class="bad-text">— ${ch.reason}</span>` : ` <span class="ok-text">— 签名、期限、用途、锚点与撤销资料均满足</span>`}
+      <div class="chain ${ch.status === "valid" ? "ok" : ch.status === "undetermined" ? "warn" : "bad"}">
+        <b>${chainLabel(ch, selected)}</b>
+        ${ch.reason ? ` <span class="${ch.status === "undetermined" ? "warn-text" : "bad-text"}">— ${ch.reason}</span>` : ` <span class="ok-text">— 签名、期限、用途、锚点与撤销资料均满足</span>`}
         ${ch.path.map((s, i) => pathArrow(s, i === 0)).join("")}
       </div>`).join("")}`;
+}
+
+function chainLabel(ch, selected) {
+  const ids = (ch.path || []).map(s => s.id).join(" → ");
+  if (ch.status === "valid") return ids === selected ? "采用路径" : "候选有效路径（未采用）";
+  if (ch.status === "undetermined") return "尚缺依据（无法确定）";
+  return "明确不合格";
 }
 
 function reprChain(res) {
@@ -142,7 +160,16 @@ function fmtStepState(s) {
 function renderCompare(prev, cur) {
   const lines = [];
   if (prev.rulesVersion !== cur.rulesVersion) lines.push(`规则版本 v${prev.rulesVersion} → v${cur.rulesVersion}`);
-  if (prev.valid !== cur.valid) lines.push(`结论：${prev.valid ? "✓ 通过" : "✗ 失败"} → ${cur.valid ? "✓ 通过" : "✗ 失败"}`);
+  const label = r => r.status === "valid" ? "✓ 通过" : r.status === "undetermined" ? "? 尚缺依据" : "✗ 失败";
+  if (label(prev) !== label(cur)) lines.push(`结论：${label(prev)} → ${label(cur)}`);
+  const polStr = p => {
+    const bits = [];
+    if (((p || {}).allowedRoots || []).length) bits.push("允许根[" + p.allowedRoots.join(",") + "]");
+    if (((p || {}).preferredRoots || []).length) bits.push("优先[" + p.preferredRoots.join(">") + "]");
+    if ((p || {}).requireCrl) bits.push("必须完整撤销资料");
+    return bits.join(" ") || "（默认策略）";
+  };
+  if (polStr(prev.policy) !== polStr(cur.policy)) lines.push(`实验策略：${polStr(prev.policy)} ⇒ ${polStr(cur.policy)}`);
   const pPath = (prev.selectedPath || []).join(" → ") || "（无有效路径）";
   const cPath = (cur.selectedPath || []).join(" → ") || "（无有效路径）";
   if (pPath !== cPath) lines.push(`采用路径：${pPath} ⇒ ${cPath}`);
@@ -174,7 +201,7 @@ function renderHistory(history) {
     details.open = i === 0;
     details.innerHTML = `
       <summary>
-        <span class="${res.valid ? "ok-text" : "bad-text"}"><b>${res.valid ? "✓ 通过" : "✗ 失败"}</b></span>
+        <span class="${res.status === "valid" ? "ok-text" : res.status === "undetermined" ? "warn-text" : "bad-text"}"><b>${res.status === "valid" ? "✓ 通过" : res.status === "undetermined" ? "? 尚缺依据" : "✗ 失败"}</b></span>
         证据 #${res.evidenceId} · 规则 v${res.rulesVersion} · ${res.leafId} · ${res.purpose} · ${fmtDate(res.checkedAt)}
         ${res.valid ? ` · 路径 ${(res.selectedPath || []).join(" → ")}` : ` · ${res.reason}`}
       </summary>
@@ -237,10 +264,18 @@ function bindForms() {
     e.preventDefault();
     const leafId = $("#verifyLeaf").value;
     const purpose = e.target.elements.purpose.value;
+    const pf = $("#policyForm");
+    const csv = s => s.split(",").map(x => x.trim()).filter(Boolean);
+    const policy = {
+      allowedRoots: csv(pf.elements.allowedRoots.value || ""),
+      preferredRoots: csv(pf.elements.preferredRoots.value || ""),
+      requireCrl: pf.elements.requireCrl.checked,
+    };
     try {
-      const res = await api("/api/verify", { method: "POST", body: JSON.stringify({ leafId, purpose }) });
+      const res = await api("/api/verify", { method: "POST", body: JSON.stringify({ leafId, purpose, policy }) });
       renderResult(res, $("#verifyResult"));
-      toast(res.valid ? `验证通过，采用路径：${res.selectedPath.join(" → ")}` : "验证失败：无有效完整链");
+      toast(res.valid ? `验证通过，采用路径：${res.selectedPath.join(" → ")}`
+        : res.status === "undetermined" ? "尚缺依据：存在无法确定的候选路径" : "验证失败：无有效完整链");
       refresh();
     } catch (err) { toast(err.message, false); }
   });
@@ -267,6 +302,13 @@ function bindForms() {
         case "crlOff":
           await api(`/api/certs/${id}/crl`, { method: "POST", body: JSON.stringify({ published: false }) });
           toast("已模拟撤销资料缺失"); break;
+        case "crlDelay": {
+          const mins = Number(prompt("CRL 生效延迟分钟数（0 = 立即生效）", "30"));
+          if (!Number.isFinite(mins)) return;
+          await api(`/api/certs/${id}/crldelay`, { method: "POST", body: JSON.stringify({ minutes: mins }) });
+          toast(mins > 0 ? `已模拟迟到 ${mins} 分钟的撤销材料` : "撤销材料已恢复即时生效");
+          break;
+        }
       }
       refresh();
     } catch (err) { toast(err.message, false); }

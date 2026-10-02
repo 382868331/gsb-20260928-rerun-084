@@ -72,5 +72,48 @@ func LoadSamples(l *Lab) error {
 	if err := l.Revoke("leaf-revoked"); err != nil {
 		return err
 	}
+
+	// 4. Cross-signing loop: imP (rootE) and imQ (rootF) cross-sign each
+	// other, so leaf-loop reaches both roots and the enumerator must walk
+	// the imP <-> imQ cycle without getting stuck.
+	if _, err := l.AddRoot("rootE", "Root E (loop demo)", 10); err != nil {
+		return err
+	}
+	if _, err := l.AddRoot("rootF", "Root F (loop demo)", 10); err != nil {
+		return err
+	}
+	if _, err := l.AddIntermediate("imP", "Intermediate P", "rootE", "", 5); err != nil {
+		return err
+	}
+	if _, err := l.AddIntermediate("imQ", "Intermediate Q", "rootF", "", 5); err != nil {
+		return err
+	}
+	if _, err := l.AddIntermediate("crossQP", "Cross of P under Q", "imQ", "imP", 5); err != nil {
+		return err
+	}
+	if _, err := l.AddIntermediate("crossPQ", "Cross of Q under P", "imP", "imQ", 5); err != nil {
+		return err
+	}
+	if _, err := l.AddLeaf("leaf-loop", "loop.lab.example", "imP",
+		[]EKU{EKUServer}, []string{"loop.lab.example"}, 90); err != nil {
+		return err
+	}
+
+	// 5. Late revocation material: tardy-im publishes a CRL whose
+	// ThisUpdate is 30 minutes in the future, so leaf-late cannot be
+	// confirmed nor ruled out until the data becomes effective.
+	if _, err := l.AddRoot("rootG", "Root G (late CRL demo)", 10); err != nil {
+		return err
+	}
+	if _, err := l.AddIntermediate("tardy-im", "Tardy Intermediate (late CRL)", "rootG", "", 5); err != nil {
+		return err
+	}
+	if err := l.SetCRLDelay("tardy-im", 30); err != nil {
+		return err
+	}
+	if _, err := l.AddLeaf("leaf-late", "late.lab.example", "tardy-im",
+		[]EKU{EKUServer}, []string{"late.lab.example"}, 90); err != nil {
+		return err
+	}
 	return nil
 }
