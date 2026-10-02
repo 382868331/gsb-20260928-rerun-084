@@ -105,17 +105,42 @@ function pathArrow(step, isFirst) {
 }
 
 function renderResult(res, target) {
+  const conclusion = res.conclusion || (res.valid ? "valid" : "invalid");
+  const verdictText = { valid: "✓ 验证通过", unknown: "？ 无法确定", invalid: "✗ 验证失败" }[conclusion] || conclusion;
+  const verdictClass = { valid: "ok", unknown: "warn", invalid: "bad" }[conclusion] || "bad";
+  const decisionLabel = {
+    selected: ["采用路径", "ok"],
+    candidate: ["合格候选（未采用）", "ok"],
+    "excluded-policy": ["被本次策略排除", "muted-decision"],
+    invalid: ["明确不合格", "bad"],
+    unknown: ["尚缺依据，无法确定", "warn"],
+  };
   target.innerHTML = `
-    <div class="verdict ${res.valid ? "ok" : "bad"}">` +
-      `${res.valid ? "✓ 验证通过" : "✗ 验证失败"} · 证书 ${res.leafId} · 用途 ${res.purpose} · 证据 #${res.evidenceId} · 规则版本 ${res.rulesVersion}</div>
-    <div class="muted">${res.valid ? "实际采用路径：" + (res.selectedPath || []).join(" → ") : "失败原因：" + (res.reason || "-")}</div>
+    <div class="verdict ${verdictClass}">` +
+      `${verdictText} · 证书 ${res.leafId} · 用途 ${res.purpose} · 证据 #${res.evidenceId} · 规则版本 ${res.rulesVersion}</div>
+    <div class="muted">${res.valid ? "实际采用路径：" + (res.selectedPath || []).join(" → ") : (conclusion === "unknown" ? "无法确定原因：" : "失败原因：") + (res.reason || "-")}</div>
+    ${res.selectionReason ? `<div class="muted">选择过程：${res.selectionReason}</div>` : ""}
+    ${res.policy ? `<div class="muted">本次策略：${fmtPolicy(res.policy)}</div>` : ""}
     <div class="muted">受信任根：${(res.trustedRoots || []).join(", ") || "（无）"} · 检查时间 ${fmtDate(res.checkedAt)}</div>
-    ${(res.chains || []).map(ch => `
-      <div class="chain ${ch.valid ? "ok" : "bad"}">
-        <b>${ch.valid ? "可用路径" : "无效路径"}</b>
-        ${ch.reason ? ` <span class="bad-text">— ${ch.reason}</span>` : ` <span class="ok-text">— 签名、期限、用途、锚点与撤销资料均满足</span>`}
+    ${(res.chains || []).map(ch => {
+      const [label, cls] = decisionLabel[ch.decision] || [ch.decision || (ch.valid ? "可用路径" : "无效路径"), ch.valid ? "ok" : "bad"];
+      const chainCls = { ok: "ok", bad: "bad", warn: "warn", "muted-decision": "excluded" }[cls] || "bad";
+      return `
+      <div class="chain ${chainCls}">
+        <b>${label}</b>
+        ${ch.reason ? ` <span class="${cls === "ok" ? "ok-text" : cls === "warn" ? "warn-text" : "bad-text"}">— ${ch.reason}</span>` : ` <span class="ok-text">— 签名、期限、用途、锚点与撤销资料均满足</span>`}
         ${ch.path.map((s, i) => pathArrow(s, i === 0)).join("")}
-      </div>`).join("")}`;
+      </div>`;
+    }).join("")}`;
+}
+
+function fmtPolicy(p) {
+  const parts = [];
+  if ((p.allowedRoots || []).length) parts.push("允许的根：" + p.allowedRoots.join(", "));
+  if ((p.rootPriority || []).length) parts.push("根优先级：" + p.rootPriority.join(" > "));
+  if (p.requireCRL) parts.push("必须撤销资料齐全");
+  if (p.maxPathLength) parts.push("路径长度上限 " + p.maxPathLength);
+  return parts.length ? parts.join("；") : "默认（全部受信根，无额外要求）";
 }
 
 function reprChain(res) {
@@ -142,10 +167,16 @@ function fmtStepState(s) {
 function renderCompare(prev, cur) {
   const lines = [];
   if (prev.rulesVersion !== cur.rulesVersion) lines.push(`规则版本 v${prev.rulesVersion} → v${cur.rulesVersion}`);
-  if (prev.valid !== cur.valid) lines.push(`结论：${prev.valid ? "✓ 通过" : "✗ 失败"} → ${cur.valid ? "✓ 通过" : "✗ 失败"}`);
+  const concOf = r => r.conclusion || (r.valid ? "valid" : "invalid");
+  const concText = { valid: "✓ 通过", unknown: "？ 无法确定", invalid: "✗ 失败" };
+  if (concOf(prev) !== concOf(cur)) lines.push(`结论：${concText[concOf(prev)]} → ${concText[concOf(cur)]}`);
+  const polOf = r => fmtPolicy(r.policy || {});
+  if (polOf(prev) !== polOf(cur)) lines.push(`实验策略：${polOf(prev)} ⇒ ${polOf(cur)}`);
   const pPath = (prev.selectedPath || []).join(" → ") || "（无有效路径）";
   const cPath = (cur.selectedPath || []).join(" → ") || "（无有效路径）";
   if (pPath !== cPath) lines.push(`采用路径：${pPath} ⇒ ${cPath}`);
+  if ((prev.selectionReason || "") !== (cur.selectionReason || "") && cur.selectionReason)
+    lines.push(`选择依据：${cur.selectionReason}`);
   const pRoots = new Set(prev.trustedRoots || []);
   const cRoots = new Set(cur.trustedRoots || []);
   for (const r of cRoots) if (!pRoots.has(r)) lines.push(`信任根新增：${r}`);
@@ -169,12 +200,14 @@ function renderHistory(history) {
   box.innerHTML = history.length ? "" : `<p class="muted">暂无验证证据。</p>`;
   history.forEach((res, i) => {
     const prev = history.slice(i + 1).find(h => h.leafId === res.leafId && h.purpose === res.purpose);
+    const conclusion = res.conclusion || (res.valid ? "valid" : "invalid");
+    const summaryMark = { valid: ["✓ 通过", "ok-text"], unknown: ["？ 无法确定", "warn-text"], invalid: ["✗ 失败", "bad-text"] }[conclusion];
     const details = document.createElement("details");
     details.className = "evidence";
     details.open = i === 0;
     details.innerHTML = `
       <summary>
-        <span class="${res.valid ? "ok-text" : "bad-text"}"><b>${res.valid ? "✓ 通过" : "✗ 失败"}</b></span>
+        <span class="${summaryMark[1]}"><b>${summaryMark[0]}</b></span>
         证据 #${res.evidenceId} · 规则 v${res.rulesVersion} · ${res.leafId} · ${res.purpose} · ${fmtDate(res.checkedAt)}
         ${res.valid ? ` · 路径 ${(res.selectedPath || []).join(" → ")}` : ` · ${res.reason}`}
       </summary>
@@ -237,10 +270,20 @@ function bindForms() {
     e.preventDefault();
     const leafId = $("#verifyLeaf").value;
     const purpose = e.target.elements.purpose.value;
+    const el = n => e.target.elements[n];
+    const csv = n => (el(n).value || "").split(",").map(s => s.trim()).filter(Boolean);
+    const policy = {
+      allowedRoots: csv("allowedRoots"),
+      rootPriority: csv("rootPriority"),
+      requireCRL: !!el("requireCRL").checked,
+      maxPathLength: Number(el("maxPathLength").value) || 0,
+    };
     try {
-      const res = await api("/api/verify", { method: "POST", body: JSON.stringify({ leafId, purpose }) });
+      const res = await api("/api/verify", { method: "POST", body: JSON.stringify({ leafId, purpose, policy }) });
       renderResult(res, $("#verifyResult"));
-      toast(res.valid ? `验证通过，采用路径：${res.selectedPath.join(" → ")}` : "验证失败：无有效完整链");
+      toast(res.valid ? `验证通过，采用路径：${res.selectedPath.join(" → ")}`
+        : res.conclusion === "unknown" ? "无法确定：所有候选路径均缺依据" : "验证失败：无有效完整链",
+        res.valid);
       refresh();
     } catch (err) { toast(err.message, false); }
   });

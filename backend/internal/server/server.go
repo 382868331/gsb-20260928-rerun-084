@@ -234,8 +234,9 @@ func (s *Server) handleCRL(w http.ResponseWriter, r *http.Request) {
 }
 
 type verifyReq struct {
-	LeafID  string `json:"leafId"`
-	Purpose string `json:"purpose"`
+	LeafID  string      `json:"leafId"`
+	Purpose string      `json:"purpose"`
+	Policy  *pki.Policy `json:"policy,omitempty"`
 }
 
 func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
@@ -243,7 +244,7 @@ func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	res, err := s.lab.Verify(req.LeafID, pki.EKU(req.Purpose))
+	res, err := s.lab.Verify(req.LeafID, pki.EKU(req.Purpose), req.Policy)
 	if err != nil {
 		writeErr(w, err)
 		return

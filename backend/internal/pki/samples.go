@@ -72,5 +72,55 @@ func LoadSamples(l *Lab) error {
 	if err := l.Revoke("leaf-revoked"); err != nil {
 		return err
 	}
+	if err := loadLoopSamples(l); err != nil {
+		return err
+	}
+	return nil
+}
+
+// loadLoopSamples adds the combined scenario: a cross-signing loop between
+// two intermediates, plus material for root-withdrawal and late-arriving
+// revocation-data experiments.
+//
+//	rootE -> imE <-cross- imF <- rootF
+//	rootF -> imF <-cross- imE <- rootE   (imE and imF cross-sign each other)
+//
+// leaf-loop is issued by imE, so its candidate paths include:
+//   - leaf-loop -> imE -> rootE                       (complete)
+//   - leaf-loop -> crossImEunderF -> imF -> rootF     (complete)
+//   - leaf-loop -> crossImEunderF -> crossImFunderE -> (loop, dead end)
+//
+// imF starts with CRL publication switched off to model revocation data
+// that has not arrived yet; restoring it demonstrates late-arriving
+// revocation material. Withdrawing trust in rootE demonstrates that the
+// remaining paths are judged independently.
+func loadLoopSamples(l *Lab) error {
+	if _, err := l.AddRoot("rootE", "Root E (loop)", 10); err != nil {
+		return err
+	}
+	if _, err := l.AddRoot("rootF", "Root F (loop)", 10); err != nil {
+		return err
+	}
+	if _, err := l.AddIntermediate("imE", "Intermediate E", "rootE", "", 5); err != nil {
+		return err
+	}
+	if _, err := l.AddIntermediate("imF", "Intermediate F", "rootF", "", 5); err != nil {
+		return err
+	}
+	// Cross-signing loop: each intermediate is also issued under the other.
+	if _, err := l.AddIntermediate("crossImEunderF", "Cross of E under F", "imF", "imE", 5); err != nil {
+		return err
+	}
+	if _, err := l.AddIntermediate("crossImFunderE", "Cross of F under E", "imE", "imF", 5); err != nil {
+		return err
+	}
+	if _, err := l.AddLeaf("leaf-loop", "loop.lab.example", "imE",
+		[]EKU{EKUServer}, []string{"loop.lab.example"}, 90); err != nil {
+		return err
+	}
+	// Revocation data for imF has not arrived yet (late CRL material).
+	if err := l.SetCRLPublished("imF", false); err != nil {
+		return err
+	}
 	return nil
 }

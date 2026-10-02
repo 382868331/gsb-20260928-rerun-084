@@ -84,6 +84,21 @@
           <option value="clientAuth">clientAuth</option>
         </select>
         <button>重新验证（保留旧证据）</button>
+        <details class="policy-box">
+          <summary>本次实验的路径选择偏好（可选，随证据保存）</summary>
+          <div class="grid policy-grid">
+            <label>允许的根范围（逗号分隔，空 = 全部受信根）
+              <input name="allowedRoots" placeholder="如 rootA, rootB" />
+            </label>
+            <label>根优先级（逗号分隔，靠前优先）
+              <input name="rootPriority" placeholder="如 rootB, rootA" />
+            </label>
+            <label>路径长度上限（0 = 不限）
+              <input name="maxPathLength" type="number" min="0" placeholder="0" />
+            </label>
+            <label class="check"><input type="checkbox" name="requireCRL" /> 必须撤销资料齐全（缺资料路径判为不合格）</label>
+          </div>
+        </details>
       </form>
       <div id="verifyResult" class="result"></div>
     </section>
