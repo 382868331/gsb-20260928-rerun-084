@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"certlab/internal/pki"
 )
@@ -138,5 +139,81 @@ func TestIssueAndRotateOverHTTP(t *testing.T) {
 	}
 	if res := doVerify(t, h, "leaf-newgen"); res["valid"] != true {
 		t.Fatalf("rotated leaf must validate: %v", res["reason"])
+	}
+}
+
+// The dual-lookback API accepts separate event time and knowledge cutoff,
+// and corrected revocations only affect investigations whose cutoff
+// includes the correction.
+func TestDualLookbackOverHTTP(t *testing.T) {
+	_, h := newHarness(t)
+
+	// Baseline investigation of a past event with current knowledge.
+	code, base := do(t, h, "POST", "/api/verify",
+		`{"leafId":"leaf-ok","purpose":"serverAuth"}`)
+	if code != http.StatusOK || base["valid"] != true {
+		t.Fatalf("baseline: %d %v", code, base["reason"])
+	}
+	if base["eventTime"] == nil || base["knowledgeCutoff"] == nil {
+		t.Fatal("evidence must record event time and knowledge cutoff")
+	}
+	chains := base["chains"].([]any)
+	ev := chains[0].(map[string]any)["evidence"].([]any)
+	if len(ev) == 0 {
+		t.Fatal("each path must list the materials its verdict used")
+	}
+
+	// Let the lab clock separate sample loading from the revocation so a
+	// knowledge cutoff can sit between them.
+	time.Sleep(1500 * time.Millisecond)
+	beforeRevoke := time.Now().UTC()
+	event := beforeRevoke.Format(time.RFC3339)
+	cutoff := beforeRevoke.Format(time.RFC3339)
+
+	// Revoke the leaf now, then correct the revocation date backwards.
+	if code, _ := do(t, h, "POST", "/api/certs/leaf-ok/revoke", `{}`); code != http.StatusOK {
+		t.Fatalf("revoke: %d", code)
+	}
+	past := time.Now().Add(-2 * time.Hour).UTC().Format(time.RFC3339)
+	code, _ = do(t, h, "POST", "/api/certs/leaf-ok/correctrevoke",
+		`{"revokedAt":"`+past+`"}`)
+	if code != http.StatusOK {
+		t.Fatalf("correctrevoke: %d", code)
+	}
+
+	// Same event moment, knowledge cutoff just before the revocation: the
+	// new revocation material must not leak into the old investigation.
+	code, old := do(t, h, "POST", "/api/verify", `{"leafId":"leaf-ok","purpose":"serverAuth",`+
+		`"eventTime":"`+event+`","knowledgeCutoff":"`+cutoff+`"}`)
+	if code != http.StatusOK {
+		t.Fatalf("old-knowledge verify: %d", code)
+	}
+	if old["valid"] != true {
+		t.Fatalf("old knowledge must not see the revocation: %v %v", old["valid"], old["reason"])
+	}
+
+	// Same event moment, current knowledge: backdated revocation fails it.
+	code, cur := do(t, h, "POST", "/api/verify", `{"leafId":"leaf-ok","purpose":"serverAuth",`+
+		`"eventTime":"`+event+`"}`)
+	if code != http.StatusOK {
+		t.Fatalf("current-knowledge verify: %d", code)
+	}
+	if cur["valid"] != false || cur["status"] != "disqualified" {
+		t.Fatalf("backdated revocation must disqualify the event: %v %v", cur["valid"], cur["reason"])
+	}
+
+	// History keeps every version, newest first, all immutable.
+	req := httptest.NewRequest("GET", "/api/history", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	var hist []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &hist); err != nil {
+		t.Fatal(err)
+	}
+	if len(hist) != 3 {
+		t.Fatalf("expected 3 evidence versions, got %d", len(hist))
+	}
+	if hist[2]["valid"] != true {
+		t.Fatal("oldest evidence must still show its original conclusion")
 	}
 }

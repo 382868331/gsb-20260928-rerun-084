@@ -16,6 +16,36 @@ go run ./cmd/certlab
 
 ## 验证规则
 
+## 双重回看：事件时刻 × 获知截止
+
+每次验证（一次历史调查）由两个独立时刻决定：
+
+- **事件时刻 eventTime**：要研究的过去时刻。证书有效期、撤销生效时间都按这一
+  时刻判断；
+- **获知截止 knowledgeCutoff**：调查允许使用的材料的取得截止时刻。只有在此之
+  前取得的证书、撤销记录、信任决定与 CRL 才参与判断——迟到、被更正或互相矛盾
+  的材料各自带有生效时间与获知时间，并列展示，不会用今天的新材料覆盖过去已
+  保存的研究。
+
+两件事可能不同：撤销材料后来才收到，却说明证书更早已经失效。同一事件时刻可以
+在取得新材料后建立新版本的调查，旧版本仍按当时知识重现（历史证据不可变）。
+
+材料的时间模型：
+
+- 证书有取得时间（learnedAt）；交叉签发的新证书不会出现在获知截止更早的调查中；
+- 撤销是追加式记录（生效时间 + 获知时间）；“更正撤销日期”追加一条新记录，
+  旧记录保留，截止时刻在更正之前的调查仍得到旧结论；
+- 根信任是事件日志；路径按“获知截止时该根是否受信”判断，根停止受信前后的
+  调查得到不同结论；
+- CRL 按获知截止重建（ThisUpdate/NextUpdate 相对截止时刻，条目只含当时已获知的
+  撤销）；缺少覆盖事件时期的撤销材料时结论保留为“尚缺依据”，不强行判定。
+
+因此不同的路径得到不同的具体原因：某条路径在事件时刻有效但当时缺少必要证据
+（尚缺依据），另一条资料完整却不符合那时的根要求（明确不合格），不会统一归为
+失败。历史比较行会区分结论变化来自新增知识、事件时刻移动还是信任条件改变。
+每条路径附带“采用材料的时间依据”（类型、生效时间、获知时间），每条证据可导出
+JSON，导出结果逐路径携带实际采用材料的时间依据。
+
 每次验证会枚举终端证书到自签根之间的全部候选密码学路径，并对每一条路径检查：
 
 - 签名链完整且由 `x509.Certificate.Verify` 确认（单张证书签名正确不代表通过）；
@@ -78,9 +108,11 @@ go run ./cmd/certlab
 - POST /api/roots、POST /api/intermediates（支持 crossSubjectId 交叉签发、负年数过期）
 - POST /api/leaves、POST /api/leaves/rotate
 - POST /api/certs/{id}/revoke、/trust、/crl
+- POST /api/certs/{id}/correctrevoke：追加更正的撤销生效日期（旧记录保留）
 - POST /api/certs/{id}/crldelay：模拟迟到撤销材料（CRL ThisUpdate 延后 N 分钟）
 - GET /api/crl/{id}：实时生成的 DER CRL
-- POST /api/verify：执行验证并追加证据（可携带 policy：allowedRoots / preferredRoots / requireCrl）
+- POST /api/verify：执行验证并追加证据（可携带 eventTime / knowledgeCutoff（RFC3339，
+  缺省为现在）与 policy：allowedRoots / preferredRoots / requireCrl）
 - GET /api/history：不可变验证证据（新到旧）
 - POST /api/samples、POST /api/reset
 

@@ -83,20 +83,22 @@
           <option value="serverAuth">serverAuth</option>
           <option value="clientAuth">clientAuth</option>
         </select>
+        <label class="check">事件时刻 <input type="datetime-local" name="eventTime" step="60" /></label>
+        <label class="check">获知截止 <input type="datetime-local" name="knowledgeCutoff" step="60" /></label>
         <button>重新验证（保留旧证据）</button>
       </form>
       <form id="policyForm" class="inline policy">
         <input name="allowedRoots" placeholder="允许的根（逗号分隔，空=全部受信根）" />
         <input name="preferredRoots" placeholder="根优先顺序（逗号分隔）" />
         <label class="check"><input type="checkbox" name="requireCrl" /> 必须具备完整撤销资料</label>
-        <span class="hint">以上偏好仅作用于下一次验证，并随证据保存，便于比较选择变化。</span>
+        <span class="hint">事件时刻=要研究的过去时刻；获知截止=只使用此前已取得的材料。留空均为现在。以上偏好仅作用于下一次验证，并随证据保存，便于比较选择变化。</span>
       </form>
       <div id="verifyResult" class="result"></div>
     </section>
 
     <section class="panel">
       <h2>历史验证证据（不可覆盖）</h2>
-      <p class="hint">每条证据保留当时的实验时钟与规则版本；展开可查看与同证书上一条证据在规则变化前后的路径比较。过期中间证书、信任根更换与撤销资料更新只产生新证据，不会改写历史判断。</p>
+      <p class="hint">每条证据保留当时的事件时刻、获知截止与规则版本；同一事件时刻可加入后来材料建立新版本，旧版本仍按当时知识重现。比较行会区分结论变化来自新增知识、事件时刻移动还是信任条件改变。过期中间证书、信任根更换与撤销资料更新只产生新证据，不会改写历史判断。</p>
       <div id="history" class="history"></div>
     </section>
   </main>

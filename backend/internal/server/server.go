@@ -62,6 +62,7 @@ func logging(h http.Handler) http.Handler {
 type stateResp struct {
 	RulesVersion int              `json:"rulesVersion"`
 	TrustedRoots []string         `json:"trustedRoots"`
+	TrustLog     []pki.TrustEvent `json:"trustLog"`
 	Now          time.Time        `json:"now"`
 	Certs        []pki.PublicView `json:"certs"`
 }
@@ -75,6 +76,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, stateResp{
 		RulesVersion: s.lab.RulesVersion(),
 		TrustedRoots: s.lab.TrustedRoots(),
+		TrustLog:     s.lab.TrustLog(),
 		Now:          s.lab.Now().UTC(),
 		Certs:        views,
 	})
@@ -196,6 +198,20 @@ func (s *Server) handleCertAction(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, err)
 			return
 		}
+	case "correctrevoke":
+		var body struct{ RevokedAt string }
+		if !decode(w, r, &body) {
+			return
+		}
+		at, err := parseTimeOpt(body.RevokedAt)
+		if err != nil || at.IsZero() {
+			writeErr(w, &badRequestError{"revokedAt must be an RFC3339 timestamp"})
+			return
+		}
+		if err := s.lab.CorrectRevocation(id, at); err != nil {
+			writeErr(w, err)
+			return
+		}
 	case "trust":
 		var body struct{ Trusted bool }
 		if r.ContentLength != 0 && !decode(w, r, &body) {
@@ -246,6 +262,23 @@ type verifyReq struct {
 	LeafID  string      `json:"leafId"`
 	Purpose string      `json:"purpose"`
 	Policy  *pki.Policy `json:"policy,omitempty"`
+	// EventTime and KnowledgeCutoff are optional RFC3339 timestamps.
+	// Empty means "now" for both. EventTime is the moment under
+	// investigation; KnowledgeCutoff limits which learned materials the
+	// investigation may use.
+	EventTime       string `json:"eventTime,omitempty"`
+	KnowledgeCutoff string `json:"knowledgeCutoff,omitempty"`
+}
+
+func parseTimeOpt(s string) (time.Time, error) {
+	if s == "" {
+		return time.Time{}, nil
+	}
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return time.Time{}, &badRequestError{"invalid timestamp " + s + ": use RFC3339"}
+	}
+	return t, nil
 }
 
 func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
@@ -253,7 +286,17 @@ func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	res, err := s.lab.Verify(req.LeafID, pki.EKU(req.Purpose), req.Policy)
+	eventTime, err := parseTimeOpt(req.EventTime)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	cutoff, err := parseTimeOpt(req.KnowledgeCutoff)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	res, err := s.lab.VerifyAt(req.LeafID, pki.EKU(req.Purpose), req.Policy, eventTime, cutoff)
 	if err != nil {
 		writeErr(w, err)
 		return
