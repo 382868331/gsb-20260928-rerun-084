@@ -28,18 +28,22 @@ const (
 // Private keys are lab-only material: they never leave the local data dir
 // and are never rendered into pages or logs.
 type Cert struct {
-	ID        string
-	Label     string
-	Kind      NodeKind
-	IssuerID  string // logical node that signed this certificate
-	ParentID  string // logical node of the issuing certificate when cross-signed
-	EKUs      []x509.ExtKeyUsage
-	Key       any // *rsa.PrivateKey / *ecdsa.PrivateKey; local only
-	Cert      *x509.Certificate
-	PEM       string // CERTIFICATE PEM
-	RevokedAt time.Time
-	Revoked   bool
-	Expires   time.Time
+	ID       string
+	Label    string
+	Kind     NodeKind
+	IssuerID string // logical node that signed this certificate
+	ParentID string // logical node of the issuing certificate when cross-signed
+	EKUs     []x509.ExtKeyUsage
+	Key      any // *rsa.PrivateKey / *ecdsa.PrivateKey; local only
+	Cert     *x509.Certificate
+	PEM      string // CERTIFICATE PEM
+	// AcquiredAt is the moment this certificate material became available
+	// to the researcher. Historical investigations with a knowledge cutoff
+	// before this moment must treat the certificate as not yet obtained.
+	AcquiredAt time.Time
+	RevokedAt  time.Time
+	Revoked    bool
+	Expires    time.Time
 	// CRLPublished reports whether this CA node publishes revocation data.
 	// False models missing CRL information for an otherwise valid CA.
 	CRLPublished bool
@@ -69,6 +73,7 @@ type PublicView struct {
 	Serial       string     `json:"serial"`
 	NotBefore    time.Time  `json:"notBefore"`
 	NotAfter     time.Time  `json:"notAfter"`
+	AcquiredAt   time.Time  `json:"acquiredAt"`
 	Revoked      bool       `json:"revoked"`
 	RevokedAt    *time.Time `json:"revokedAt,omitempty"`
 	CRLPublished bool       `json:"crlPublished"`
@@ -93,19 +98,20 @@ func ekuNames(usages []x509.ExtKeyUsage) []string {
 // View returns the private-key-free representation of a cert.
 func (c *Cert) View() PublicView {
 	v := PublicView{
-		ID:        c.ID,
-		Label:     c.Label,
-		Kind:      c.Kind,
-		IssuerID:  c.IssuerID,
-		ParentID:  c.ParentID,
-		EKUs:      ekuNames(c.EKUs),
-		Subject:   c.Cert.Subject.String(),
-		Issuer:    c.Cert.Issuer.String(),
-		Serial:    c.Cert.SerialNumber.String(),
-		NotBefore: c.Cert.NotBefore,
-		NotAfter:  c.Cert.NotAfter,
-		Revoked:   c.Revoked,
-		PEM:       c.PEM,
+		ID:         c.ID,
+		Label:      c.Label,
+		Kind:       c.Kind,
+		IssuerID:   c.IssuerID,
+		ParentID:   c.ParentID,
+		EKUs:       ekuNames(c.EKUs),
+		Subject:    c.Cert.Subject.String(),
+		Issuer:     c.Cert.Issuer.String(),
+		Serial:     c.Cert.SerialNumber.String(),
+		NotBefore:  c.Cert.NotBefore,
+		NotAfter:   c.Cert.NotAfter,
+		AcquiredAt: c.AcquiredAt,
+		Revoked:    c.Revoked,
+		PEM:        c.PEM,
 	}
 	if c.Revoked {
 		t := c.RevokedAt

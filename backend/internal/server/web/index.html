@@ -83,15 +83,23 @@
           <option value="serverAuth">serverAuth</option>
           <option value="clientAuth">clientAuth</option>
         </select>
+        <label class="check">事件时刻 <input type="datetime-local" name="eventTime" step="1" /></label>
+        <label class="check">获知截止 <input type="datetime-local" name="knowledgeCutoff" step="1" /></label>
         <button>重新验证（保留旧证据）</button>
       </form>
       <form id="policyForm" class="inline policy">
         <input name="allowedRoots" placeholder="允许的根（逗号分隔，空=全部受信根）" />
         <input name="preferredRoots" placeholder="根优先顺序（逗号分隔）" />
         <label class="check"><input type="checkbox" name="requireCrl" /> 必须具备完整撤销资料</label>
-        <span class="hint">以上偏好仅作用于下一次验证，并随证据保存，便于比较选择变化。</span>
+        <span class="hint">事件时刻与获知截止留空表示当前实验时钟；两者可不同——迟到的撤销材料说明证书更早已失效，但旧调查仍按当时知识重现。以上偏好仅作用于下一次验证，并随证据保存。</span>
       </form>
       <div id="verifyResult" class="result"></div>
+    </section>
+
+    <section class="panel">
+      <h2>材料台账（信任 / 撤销，按获知并列）</h2>
+      <p class="hint">每份材料同时记录生效时间与获知时间；迟到、被更正或互相矛盾的材料并列展示，旧调查不会被动用后来的材料。</p>
+      <div id="knowledge" class="history"></div>
     </section>
 
     <section class="panel">

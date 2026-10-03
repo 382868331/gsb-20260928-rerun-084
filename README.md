@@ -33,6 +33,34 @@ go run ./cmd/certlab
 某条路径资料不全不影响其他完整路径独立判断；全部路径都缺依据时整体结论为
 “尚缺依据”，保留不确定部分而不是强行判定失败。
 
+## 双重回看：事件时刻 × 获知截止
+
+一次历史调查同时回答两个可能不同的问题：证书在某个**事件时刻**是否有效，
+以及**获知截止**之前凭已取得的材料能作出什么判断。验证表单可分别指定两者
+（留空均为当前实验时钟）：
+
+- 期限、撤销生效、根信任生效都按**事件时刻**判定；
+- 证书、根信任材料、撤销通知、CRL 各自带**获知时间**，只有获知时间不晚于
+  获知截止的材料才参与判断；
+- 撤销通知可以迟到（获知时间在未来）却声明更早已失效：旧截止的调查仍然
+  通过，同一事件时刻用更晚的截止重新调查则判不合格，两个版本都保留；
+- 撤销日期可被更正：多份撤销材料并列于“材料台账”，调查采用获知截止前
+  最新的一份；
+- 缺少覆盖事件时刻的撤销材料时结论保持“尚缺依据”，不强行判定失败。
+
+每条候选路径独立给出结论与原因：某条路径在事件时刻有效但当时缺少必要
+证据（尚缺依据），另一条资料完整却不符合当时的根要求（明确不合格），
+不会统一归为失败。历史比较会标注结论变化的来源：新增知识（获知截止
+移动）、事件时间移动，或研究者改变了信任条件（策略差异）。
+
+## 材料台账与导出
+
+- GET /api/knowledge 并列列出全部根信任材料与撤销材料（生效时间 + 获知
+  时间 + 备注），迟到、被更正、互相矛盾的材料同时可见；
+- GET /api/history/{id}/export 导出一次调查：逐路径附带实际采用材料的
+  生效/获知时间依据，并声明这些时间不代表事件时刻已完成验证——当时
+  没有掌握的证据不会被描述成当时已验证通过。
+
 ## 实验策略（每次验证可指定）
 
 验证表单可为单次实验指定：
@@ -68,6 +96,9 @@ go run ./cmd/certlab
 | leaf-revoked | 已撤销终端证书，序列号出现在实时 CRL 中 | 失败：证书已撤销 / CRL 列名 |
 | leaf-loop | imP 与 imQ 互相交叉签发成环，叶证书可经 rootE 或 rootF 到达 | 枚举不死循环，两条根路径均为候选 |
 | leaf-late | tardy-im 的 CRL 生效时间在未来 30 分钟（迟到撤销材料） | 尚缺依据：撤销资料尚未生效 |
+| leaf-laterev | 撤销通知迟到 2 小时，却声明 24 小时前已撤销 | 当前获知截止下通过；同一事件时刻用更晚截止重查则不合格 |
+| leaf-corrected | 撤销日期被更正提前 48 小时，两份材料并列 | 事件在更正日期之后即判撤销 |
+| leaf-rootcut | rootJ 将于 1 小时后停止受信（材料已取得） | 事件在信任截止前通过，之后因锚点不合格 |
 
 页面还可把 rootA 取消信任，演示根切换后 leaf-ok 自动改走 rootB→crossX 路径；
 重新验证后历史中同时保留切换前、后两条证据。
@@ -78,10 +109,15 @@ go run ./cmd/certlab
 - POST /api/roots、POST /api/intermediates（支持 crossSubjectId 交叉签发、负年数过期）
 - POST /api/leaves、POST /api/leaves/rotate
 - POST /api/certs/{id}/revoke、/trust、/crl
+- POST /api/certs/{id}/revoke 可携带 revokedAt / acquiredAt / note（迟到或更正的撤销材料）
+- POST /api/certs/{id}/trust 可携带 effectiveFrom / acquiredAt（定时信任变更）
 - POST /api/certs/{id}/crldelay：模拟迟到撤销材料（CRL ThisUpdate 延后 N 分钟）
 - GET /api/crl/{id}：实时生成的 DER CRL
-- POST /api/verify：执行验证并追加证据（可携带 policy：allowedRoots / preferredRoots / requireCrl）
+- POST /api/verify：执行验证并追加证据（可携带 eventTime / knowledgeCutoff 与
+  policy：allowedRoots / preferredRoots / requireCrl）
 - GET /api/history：不可变验证证据（新到旧）
+- GET /api/history/{id}/export：逐路径导出采用材料的时间依据
+- GET /api/knowledge：全部信任 / 撤销材料台账
 - POST /api/samples、POST /api/reset
 
 ## 测试

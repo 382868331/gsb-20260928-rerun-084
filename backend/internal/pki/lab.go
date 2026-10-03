@@ -21,6 +21,8 @@ type Lab struct {
 	seq          atomic.Uint64
 	certs        map[string]*Cert
 	trust        map[string]bool // logical root IDs currently trusted
+	trustLog     []TrustEvent
+	revLog       []RevocationEvent
 	nowFunc      func() time.Time
 	history      []*VerifyResult
 	rulesVersion int
@@ -75,9 +77,14 @@ func (l *Lab) AddRoot(id, cn string, years int) (*Cert, error) {
 		return nil, err
 	}
 	c.CRLPublished = true
+	c.AcquiredAt = now.UTC()
 	l.put(c)
 	l.trust[id] = true
-	l.rulesVersion++
+	l.recordTrustLocked(TrustEvent{
+		RootID: id, Trusted: true,
+		EffectiveFrom: c.Cert.NotBefore.UTC(), AcquiredAt: now.UTC(),
+		Note: "root created and trusted",
+	})
 	return c, nil
 }
 
@@ -113,6 +120,7 @@ func (l *Lab) AddIntermediate(id, cn, issuerID, crossSubjectID string, years int
 		return nil, err
 	}
 	c.CRLPublished = true
+	c.AcquiredAt = now.UTC()
 	l.put(c)
 	return c, nil
 }
@@ -161,6 +169,7 @@ func (l *Lab) addLeafLocked(id, cn, issuerID string, ekus []EKU, dnsNames []stri
 	if err != nil {
 		return nil, err
 	}
+	c.AcquiredAt = now.UTC()
 	l.put(c)
 	return c, nil
 }
@@ -217,8 +226,11 @@ func (l *Lab) SetTrust(rootID string, trusted bool) error {
 		return fmt.Errorf("root %q not found", rootID)
 	}
 	if l.trust[rootID] != trusted {
-		l.trust[rootID] = trusted
-		l.rulesVersion++
+		now := l.nowFunc()
+		l.recordTrustLocked(TrustEvent{
+			RootID: rootID, Trusted: trusted,
+			EffectiveFrom: now.UTC(), AcquiredAt: now.UTC(),
+		})
 	}
 	return nil
 }
@@ -251,8 +263,10 @@ func (l *Lab) Revoke(id string) error {
 		return fmt.Errorf("cert %q not found", id)
 	}
 	if !c.Revoked {
-		c.Revoked = true
-		c.RevokedAt = l.nowFunc().UTC()
+		now := l.nowFunc()
+		l.recordRevocationLocked(RevocationEvent{
+			CertID: id, RevokedAt: now.UTC(), AcquiredAt: now.UTC(),
+		})
 	}
 	return nil
 }
@@ -314,19 +328,28 @@ func (l *Lab) CRL(caID string) ([]byte, error) {
 	if !ca.CRLPublished {
 		return nil, fmt.Errorf("CA %q does not publish revocation data", caID)
 	}
-	return l.buildCRLLocked(ca)
+	return l.buildCRLLocked(ca, l.nowFunc())
 }
 
-func (l *Lab) buildCRLLocked(ca *Cert) ([]byte, error) {
+// buildCRLLocked renders the CA's CRL as known at knowledge cutoff: only
+// revocation material obtained by the cutoff is listed. The CRL's
+// ThisUpdate doubles as the material's acquisition time; CRLDelayMin
+// pushes it into the future to model late-arriving revocation data.
+func (l *Lab) buildCRLLocked(ca *Cert, cutoff time.Time) ([]byte, error) {
 	now := l.nowFunc()
 	entries := []x509.RevocationListEntry{}
-	for _, c := range l.certs {
-		if c.IssuerID == ca.ID && c.Revoked {
-			entries = append(entries, x509.RevocationListEntry{
-				SerialNumber:   new(big.Int).Set(c.Cert.SerialNumber),
-				RevocationTime: c.RevokedAt,
-			})
+	for _, ev := range l.revLog {
+		if ev.AcquiredAt.After(cutoff) {
+			continue
 		}
+		c, ok := l.certs[ev.CertID]
+		if !ok || c.IssuerID != ca.ID {
+			continue
+		}
+		entries = append(entries, x509.RevocationListEntry{
+			SerialNumber:   new(big.Int).Set(c.Cert.SerialNumber),
+			RevocationTime: ev.RevokedAt,
+		})
 	}
 	tmpl := &x509.RevocationList{
 		Number:                    new(big.Int).SetUint64(l.seq.Add(1)),
@@ -359,6 +382,8 @@ func (l *Lab) Reset() {
 	defer l.mu.Unlock()
 	l.certs = map[string]*Cert{}
 	l.trust = map[string]bool{}
+	l.trustLog = nil
+	l.revLog = nil
 	l.history = nil
 	l.seq.Store(0)
 	l.rulesVersion = 1

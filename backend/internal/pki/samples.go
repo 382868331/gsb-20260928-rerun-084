@@ -1,5 +1,7 @@
 package pki
 
+import "time"
+
 // LoadSamples builds three local scenarios in one lab:
 //
 //  1. Cross-signing (root migration):
@@ -113,6 +115,62 @@ func LoadSamples(l *Lab) error {
 	}
 	if _, err := l.AddLeaf("leaf-late", "late.lab.example", "tardy-im",
 		[]EKU{EKUServer}, []string{"late.lab.example"}, 90); err != nil {
+		return err
+	}
+
+	// 6. Late revocation notice: the notice says leaf-laterev was revoked
+	// a day ago, but it only arrives two hours from now. An investigation
+	// with today's knowledge cutoff finds nothing; the same event time
+	// re-investigated after the notice arrives is disqualified.
+	if _, err := l.AddRoot("rootH", "Root H (late revocation notice)", 10); err != nil {
+		return err
+	}
+	if _, err := l.AddIntermediate("drip-im", "Drip Intermediate", "rootH", "", 5); err != nil {
+		return err
+	}
+	if _, err := l.AddLeaf("leaf-laterev", "laterev.lab.example", "drip-im",
+		[]EKU{EKUServer}, []string{"laterev.lab.example"}, 90); err != nil {
+		return err
+	}
+	now := l.Now()
+	if err := l.RevokeTimed("leaf-laterev", now.Add(-24*time.Hour), now.Add(2*time.Hour),
+		"late notice: certificate was already revoked 24h before it arrived"); err != nil {
+		return err
+	}
+
+	// 7. Corrected revocation date: two notices coexist; the second
+	// corrects the revocation moment 48h earlier. Both stay listed side
+	// by side; investigations use the newest notice known by the cutoff.
+	if _, err := l.AddRoot("rootI", "Root I (corrected revocation)", 10); err != nil {
+		return err
+	}
+	if _, err := l.AddIntermediate("fix-im", "Fix Intermediate", "rootI", "", 5); err != nil {
+		return err
+	}
+	if _, err := l.AddLeaf("leaf-corrected", "corrected.lab.example", "fix-im",
+		[]EKU{EKUServer}, []string{"corrected.lab.example"}, 90); err != nil {
+		return err
+	}
+	if err := l.Revoke("leaf-corrected"); err != nil {
+		return err
+	}
+	if err := l.RevokeTimed("leaf-corrected", now.Add(-48*time.Hour), now,
+		"correction: revocation date moved 48h earlier"); err != nil {
+		return err
+	}
+
+	// 8. Scheduled root distrust: rootJ stops being trusted one hour from
+	// now (material already obtained). Events before the cut still
+	// validate; events after it fail on the anchor requirement.
+	if _, err := l.AddRoot("rootJ", "Root J (trust ends soon)", 10); err != nil {
+		return err
+	}
+	if _, err := l.AddLeaf("leaf-rootcut", "rootcut.lab.example", "rootJ",
+		[]EKU{EKUServer}, []string{"rootcut.lab.example"}, 90); err != nil {
+		return err
+	}
+	if err := l.SetTrustTimed("rootJ", false, now.Add(time.Hour), now,
+		"root stops being trusted in 1h"); err != nil {
 		return err
 	}
 	return nil

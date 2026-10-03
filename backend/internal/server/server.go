@@ -3,6 +3,7 @@ package server
 import (
 	"embed"
 	"encoding/json"
+	"fmt"
 	"io/fs"
 	"log"
 	"net/http"
@@ -41,6 +42,8 @@ func (s *Server) routes() {
 	mux.HandleFunc("GET /api/crl/{id}", s.handleCRL)
 	mux.HandleFunc("POST /api/verify", s.handleVerify)
 	mux.HandleFunc("GET /api/history", s.handleHistory)
+	mux.HandleFunc("GET /api/history/{id}/export", s.handleExport)
+	mux.HandleFunc("GET /api/knowledge", s.handleKnowledge)
 	mux.HandleFunc("POST /api/samples", s.handleSamples)
 	mux.HandleFunc("POST /api/reset", s.handleReset)
 
@@ -192,14 +195,57 @@ func (s *Server) handleCertAction(w http.ResponseWriter, r *http.Request) {
 	}
 	switch action {
 	case "revoke":
+		var body struct {
+			RevokedAt  *time.Time `json:"revokedAt"`
+			AcquiredAt *time.Time `json:"acquiredAt"`
+			Note       string     `json:"note"`
+		}
+		if r.ContentLength > 0 && !decode(w, r, &body) {
+			return
+		}
+		if body.RevokedAt != nil || body.AcquiredAt != nil {
+			now := s.lab.Now()
+			rev, acq := now, now
+			if body.RevokedAt != nil {
+				rev = *body.RevokedAt
+			}
+			if body.AcquiredAt != nil {
+				acq = *body.AcquiredAt
+			}
+			if err := s.lab.RevokeTimed(id, rev, acq, body.Note); err != nil {
+				writeErr(w, err)
+				return
+			}
+			break
+		}
 		if err := s.lab.Revoke(id); err != nil {
 			writeErr(w, err)
 			return
 		}
 	case "trust":
-		var body struct{ Trusted bool }
+		var body struct {
+			Trusted       bool       `json:"trusted"`
+			EffectiveFrom *time.Time `json:"effectiveFrom"`
+			AcquiredAt    *time.Time `json:"acquiredAt"`
+			Note          string     `json:"note"`
+		}
 		if r.ContentLength != 0 && !decode(w, r, &body) {
 			return
+		}
+		if body.EffectiveFrom != nil || body.AcquiredAt != nil {
+			now := s.lab.Now()
+			eff, acq := now, now
+			if body.EffectiveFrom != nil {
+				eff = *body.EffectiveFrom
+			}
+			if body.AcquiredAt != nil {
+				acq = *body.AcquiredAt
+			}
+			if err := s.lab.SetTrustTimed(id, body.Trusted, eff, acq, body.Note); err != nil {
+				writeErr(w, err)
+				return
+			}
+			break
 		}
 		if err := s.lab.SetTrust(id, body.Trusted); err != nil {
 			writeErr(w, err)
@@ -243,9 +289,11 @@ func (s *Server) handleCRL(w http.ResponseWriter, r *http.Request) {
 }
 
 type verifyReq struct {
-	LeafID  string      `json:"leafId"`
-	Purpose string      `json:"purpose"`
-	Policy  *pki.Policy `json:"policy,omitempty"`
+	LeafID          string      `json:"leafId"`
+	Purpose         string      `json:"purpose"`
+	Policy          *pki.Policy `json:"policy,omitempty"`
+	EventTime       *time.Time  `json:"eventTime,omitempty"`
+	KnowledgeCutoff *time.Time  `json:"knowledgeCutoff,omitempty"`
 }
 
 func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
@@ -253,7 +301,7 @@ func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	res, err := s.lab.Verify(req.LeafID, pki.EKU(req.Purpose), req.Policy)
+	res, err := s.lab.VerifyAt(req.LeafID, pki.EKU(req.Purpose), req.Policy, req.EventTime, req.KnowledgeCutoff)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -263,6 +311,53 @@ func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.lab.History())
+}
+
+func (s *Server) handleKnowledge(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.lab.Knowledge())
+}
+
+// exportDoc is the per-path export of one saved investigation. Every path
+// carries the material basis actually used, each item with its effective
+// and acquisition times, so an export can never describe material obtained
+// after the knowledge cutoff as if it had been verified at the event time.
+type exportDoc struct {
+	EvidenceID      int               `json:"evidenceId"`
+	LeafID          string            `json:"leafId"`
+	Purpose         string            `json:"purpose"`
+	EventTime       time.Time         `json:"eventTime"`
+	KnowledgeCutoff time.Time         `json:"knowledgeCutoff"`
+	CheckedAt       time.Time         `json:"checkedAt"`
+	RulesVersion    int               `json:"rulesVersion"`
+	Status          pki.ChainStatus   `json:"status"`
+	Reason          string            `json:"reason,omitempty"`
+	SelectedPath    []string          `json:"selectedPath,omitempty"`
+	Chains          []pki.ChainReport `json:"chains"`
+	Disclaimer      string            `json:"disclaimer"`
+}
+
+func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var n int
+	if _, err := fmt.Sscanf(id, "%d", &n); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid evidence id"})
+		return
+	}
+	for _, ev := range s.lab.History() {
+		if ev.EvidenceID != n {
+			continue
+		}
+		writeJSON(w, http.StatusOK, exportDoc{
+			EvidenceID: ev.EvidenceID, LeafID: ev.LeafID, Purpose: ev.Purpose,
+			EventTime: ev.EventTime, KnowledgeCutoff: ev.KnowledgeCutoff,
+			CheckedAt: ev.CheckedAt, RulesVersion: ev.RulesVersion,
+			Status: ev.Status, Reason: ev.Reason, SelectedPath: ev.SelectedPath,
+			Chains:     ev.Chains,
+			Disclaimer: "Each path used only material acquired by the knowledge cutoff; listed times are the materials' effective/acquisition times, not a claim that the evidence was verified at the event time.",
+		})
+		return
+	}
+	writeJSON(w, http.StatusNotFound, map[string]string{"error": "evidence not found"})
 }
 
 func (s *Server) handleSamples(w http.ResponseWriter, r *http.Request) {
