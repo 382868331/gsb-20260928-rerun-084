@@ -1,6 +1,7 @@
 package pki
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -122,22 +123,25 @@ func TestCorrectedRevocationDate(t *testing.T) {
 	}
 }
 
-// Trust decisions are evaluated as known at the cutoff: a path valid while
-// the root was trusted becomes disqualified once the distrust is learned,
-// with a distinct reason from missing evidence.
-func TestTrustEvaluatedAtKnowledgeCutoff(t *testing.T) {
+// Trust decisions carry separate effective and learned times: a distrust
+// that became effective after the event must not poison a later review of
+// that event, even when the knowledge cutoff includes the distrust. Only
+// an event after the distrust took effect is disqualified.
+func TestTrustEvaluatedAtEventTime(t *testing.T) {
 	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	l, cur := clockLab(t, t0)
 	buildChain(t, l)
 
 	event := t0.Add(time.Hour)
-	t4 := t0.Add(2 * time.Hour)
-	*cur = t4
+	// The distrust is learned (and effective) 30s after the event.
+	distrustAt := event.Add(30 * time.Second)
+	*cur = distrustAt
 	if err := l.SetTrust("r1", false); err != nil {
 		t.Fatal(err)
 	}
 
-	whileTrusted, err := l.VerifyAt("leaf1", EKUServer, nil, event, event.Add(30*time.Second))
+	// Cutoff before the distrust was learned: trusted.
+	whileTrusted, err := l.VerifyAt("leaf1", EKUServer, nil, event, event.Add(15*time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,15 +149,231 @@ func TestTrustEvaluatedAtKnowledgeCutoff(t *testing.T) {
 		t.Fatalf("cutoff before distrust must still validate: %s", whileTrusted.Reason)
 	}
 
-	afterDistrust, err := l.VerifyAt("leaf1", EKUServer, nil, event, t4.Add(time.Minute))
+	// Cutoff after the distrust was learned, but the event predates its
+	// effective time: the later knowledge must not change the verdict.
+	review, err := l.VerifyAt("leaf1", EKUServer, nil, event, distrustAt.Add(15*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !review.Valid {
+		t.Fatalf("distrust effective after the event must not disqualify it, got %v %q",
+			review.Valid, review.Reason)
+	}
+
+	// An event after the distrust took effect is disqualified, with a
+	// distinct trust reason (not missing evidence).
+	laterEvent := distrustAt.Add(30 * time.Second)
+	afterDistrust, err := l.VerifyAt("leaf1", EKUServer, nil, laterEvent, distrustAt.Add(time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if afterDistrust.Valid || afterDistrust.Status != StatusDisqualified {
 		t.Fatalf("expected disqualified after distrust, got %v %q", afterDistrust.Valid, afterDistrust.Status)
 	}
-	if !strings.Contains(afterDistrust.Reason, "not a trusted anchor as of the knowledge cutoff") {
-		t.Fatalf("expected cutoff trust reason, got %q", afterDistrust.Reason)
+	if !strings.Contains(afterDistrust.Reason, "not a trusted anchor at the event time") {
+		t.Fatalf("expected event-time trust reason, got %q", afterDistrust.Reason)
+	}
+}
+
+// A trust decision learned early but only effective in the future does not
+// apply to events before its effective time, even when the knowledge
+// cutoff already includes the decision.
+func TestFutureEffectiveTrustLearnedEarly(t *testing.T) {
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	l, cur := clockLab(t, t0)
+	buildChain(t, l)
+
+	// Learn now that the root will be distrusted in two hours.
+	effective := t0.Add(2 * time.Hour)
+	if err := l.SetTrustAt("r1", false, effective); err != nil {
+		t.Fatal(err)
+	}
+	cutoff := t0.Add(30 * time.Minute)
+
+	// Event before the scheduled distrust: still trusted.
+	before, err := l.VerifyAt("leaf1", EKUServer, nil, t0.Add(time.Hour), cutoff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !before.Valid {
+		t.Fatalf("future-effective distrust must not apply yet: %s", before.Reason)
+	}
+
+	// Event after the scheduled distrust: disqualified, same cutoff.
+	*cur = t0.Add(3 * time.Hour)
+	after, err := l.VerifyAt("leaf1", EKUServer, nil, effective.Add(30*time.Minute), t0.Add(3*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Valid || after.Status != StatusDisqualified {
+		t.Fatalf("expected disqualified once the distrust is effective, got %v %q", after.Valid, after.Status)
+	}
+}
+
+// Late-arriving revocation material: the lab learns today that the
+// certificate was revoked with effect before the event. Investigations
+// with an earlier cutoff stay reproducible; new ones see the backdate.
+func TestLateArrivingRevocationMaterial(t *testing.T) {
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	l, cur := clockLab(t, t0)
+	buildChain(t, l)
+
+	event := t0.Add(time.Hour)
+	// The revocation material arrives an hour after the event but is
+	// effective 30 minutes before it.
+	*cur = event.Add(time.Hour)
+	if err := l.RevokeAt("leaf1", event.Add(-30*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	old, err := l.VerifyAt("leaf1", EKUServer, nil, event, event.Add(15*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !old.Valid {
+		t.Fatalf("cutoff before the material arrived must not see it: %s", old.Reason)
+	}
+
+	review, err := l.VerifyAt("leaf1", EKUServer, nil, event, event.Add(2*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if review.Valid || review.Status != StatusDisqualified {
+		t.Fatalf("backdated revocation must disqualify the event, got %v %q", review.Valid, review.Status)
+	}
+	if !strings.Contains(review.Reason, "revoked with effect") {
+		t.Fatalf("expected effective-time reason, got %q", review.Reason)
+	}
+}
+
+// A retraction withdraws a revocation claim for new investigations while
+// older investigations keep concluding "revoked" from their cutoff.
+func TestRetractedRevocationMaterial(t *testing.T) {
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	l, cur := clockLab(t, t0)
+	buildChain(t, l)
+
+	event := t0.Add(time.Hour)
+	*cur = event.Add(-time.Minute)
+	if err := l.Revoke("leaf1"); err != nil {
+		t.Fatal(err)
+	}
+	retractedAt := event.Add(30 * time.Second)
+	*cur = retractedAt
+	if err := l.RetractRevocation("leaf1", "claim withdrawn by CA"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Cutoff between revocation and retraction: revoked.
+	rev, err := l.VerifyAt("leaf1", EKUServer, nil, event, event.Add(15*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rev.Valid || rev.Status != StatusDisqualified {
+		t.Fatalf("cutoff before retraction must still see the revocation, got %v %q", rev.Valid, rev.Status)
+	}
+
+	// Cutoff after the retraction: not revoked.
+	after, err := l.VerifyAt("leaf1", EKUServer, nil, event, retractedAt.Add(15*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.Valid {
+		t.Fatalf("retracted revocation must clear the event: %s", after.Reason)
+	}
+	found := false
+	for _, ch := range after.Chains {
+		for _, m := range ch.Evidence {
+			if m.Type == "revocation" && strings.Contains(m.Detail, "撤回") {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatal("report must cite the retraction it relied on")
+	}
+}
+
+// Conflicting same-source revocation claims must be surfaced with the
+// adoption basis instead of silently overwriting.
+func TestConflictingRevocationClaimsExplained(t *testing.T) {
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	l, cur := clockLab(t, t0)
+	buildChain(t, l)
+
+	*cur = t0.Add(time.Hour)
+	if err := l.Revoke("leaf1"); err != nil {
+		t.Fatal(err)
+	}
+	*cur = t0.Add(2 * time.Hour)
+	if err := l.CorrectRevocation("leaf1", t0.Add(30*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := l.VerifyAt("leaf1", EKUServer, nil, t0.Add(3*time.Hour), t0.Add(3*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var detail string
+	for _, ch := range res.Chains {
+		for _, m := range ch.Evidence {
+			if m.Type == "revocation" {
+				detail = m.Detail
+			}
+		}
+	}
+	if !strings.Contains(detail, "同源撤销记录") {
+		t.Fatalf("expected conflict explanation in revocation evidence, got %q", detail)
+	}
+}
+
+// A saved lab reloads with the same materials, trust log and immutable
+// evidence: reopening never changes a saved report's conclusion.
+func TestPersistenceRoundTrip(t *testing.T) {
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	l, cur := clockLab(t, t0)
+	buildChain(t, l)
+	*cur = t0.Add(time.Hour)
+	if err := l.SetTrustAt("r1", false, t0.Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.RevokeAt("leaf1", t0.Add(30*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.VerifyAt("leaf1", EKUServer, nil, t0.Add(time.Hour), t0.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "lab.json")
+	if err := l.SetStore(path); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := LoadLab(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reopened == nil {
+		t.Fatal("expected a restored lab")
+	}
+	reopened.SetClock(func() time.Time { return t0.Add(time.Hour) })
+	if got := len(reopened.History()); got != 1 {
+		t.Fatalf("saved evidence must survive reopening, got %d", got)
+	}
+	if got := len(reopened.TrustLog()); got != 2 {
+		t.Fatalf("trust log must survive reopening, got %d", got)
+	}
+	// The same investigation on the reopened lab reaches the same
+	// conclusion (revoked with effect before the event).
+	res, err := reopened.VerifyAt("leaf1", EKUServer, nil, t0.Add(time.Hour), t0.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Valid || res.Status != StatusDisqualified {
+		t.Fatalf("reopened lab must reproduce the saved basis, got %v %q", res.Valid, res.Status)
+	}
+	// And the future-effective distrust is still scheduled, not yet active.
+	if roots := reopened.TrustedRoots(); len(roots) != 1 || roots[0] != "r1" {
+		t.Fatalf("future-effective distrust must not be active yet, got %v", roots)
 	}
 }
 

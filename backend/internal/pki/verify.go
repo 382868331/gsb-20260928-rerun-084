@@ -3,6 +3,7 @@ package pki
 import (
 	"crypto/x509"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
@@ -196,11 +197,15 @@ func (l *Lab) VerifyAt(leafID string, purpose EKU, policy *Policy, eventTime, kn
 		CheckedAt: now.UTC(), Policy: pol,
 		EventTime: eventTime.UTC(), KnowledgeCutoff: knowledgeCutoff.UTC(),
 	}
-	for id := range l.trust {
-		if l.trust[id] {
+	for id, c := range l.certs {
+		if c.Kind != KindRoot {
+			continue
+		}
+		if trusted, _, known := l.trustedAtLocked(id, eventTime, knowledgeCutoff); known && trusted {
 			res.TrustedRoots = append(res.TrustedRoots, id)
 		}
 	}
+	sort.Strings(res.TrustedRoots)
 
 	// Enumerate every cryptographic path from the leaf to a self-signed root.
 	// Only certificates obtained on or before the knowledge cutoff may
@@ -222,7 +227,7 @@ func (l *Lab) VerifyAt(leafID string, purpose EKU, policy *Policy, eventTime, kn
 				Revoked: c.Revoked, CRLPublished: c.CRLPublished,
 			}
 			if c.Kind == KindRoot {
-				trusted, _, known := l.trustedAtLocked(c.ID, knowledgeCutoff)
+				trusted, _, known := l.trustedAtLocked(c.ID, eventTime, knowledgeCutoff)
 				step.Trusted = known && trusted
 			}
 			report.Path = append(report.Path, step)
@@ -267,6 +272,7 @@ func (l *Lab) VerifyAt(leafID string, purpose EKU, policy *Policy, eventTime, kn
 	}
 	l.history = append(l.history, res)
 	res.EvidenceID = len(l.history)
+	l.persist()
 	return res, nil
 }
 
@@ -335,11 +341,30 @@ func (l *Lab) evaluateChain(chain []*Cert, wantEKU x509.ExtKeyUsage, eventTime, 
 		if eventTime.After(c.Cert.NotAfter) {
 			return StatusDisqualified, fmt.Sprintf("certificate %q expired at the event time", c.Label)
 		}
-		if rec, known := revocationAtLocked(c, cutoff); known {
+		claims := revocationClaimsLocked(c, cutoff)
+		if rec, known := revocationAtLocked(c, cutoff); len(claims) > 0 {
 			rev, learned := rec.RevokedAt, rec.LearnedAt
+			detail := rec.Note
+			if len(claims) > 1 {
+				// Conflicting same-source material: state the adoption
+				// basis instead of silently overwriting older claims.
+				detail = strings.TrimSpace(detail + " " + fmt.Sprintf(
+					"（同源撤销记录共 %d 条，采用获知时间最新者；其余记录未覆盖）", len(claims)))
+			}
+			if !known {
+				// Latest known claim is a retraction: the certificate
+				// counts as not revoked at this cutoff, but the record
+				// is still cited so the report explains the basis.
+				report.Evidence = append(report.Evidence, MaterialRef{
+					Type: "revocation", ID: c.ID, Label: c.Label,
+					EffectiveAt: &rev, LearnedAt: &learned,
+					Detail: strings.TrimSpace("撤销已撤回 " + detail),
+				})
+				continue
+			}
 			report.Evidence = append(report.Evidence, MaterialRef{
 				Type: "revocation", ID: c.ID, Label: c.Label,
-				EffectiveAt: &rev, LearnedAt: &learned, Detail: rec.Note,
+				EffectiveAt: &rev, LearnedAt: &learned, Detail: detail,
 			})
 			if !rec.RevokedAt.After(eventTime) {
 				return StatusDisqualified, fmt.Sprintf(
@@ -356,12 +381,21 @@ func (l *Lab) evaluateChain(chain []*Cert, wantEKU x509.ExtKeyUsage, eventTime, 
 	if root.Kind != KindRoot || root.Cert.Subject.String() != root.Cert.Issuer.String() {
 		return StatusDisqualified, "chain does not end at a self-signed root"
 	}
-	trusted, trustAt, trustKnown := l.trustedAtLocked(root.ID, cutoff)
+	trusted, trustEv, trustKnown := l.trustedAtLocked(root.ID, eventTime, cutoff)
 	if trustKnown {
+		detail := map[bool]string{true: "受信任", false: "停止受信"}[trusted]
+		if superseded, pending := l.trustConflictsLocked(root.ID, eventTime, cutoff, trustEv); superseded+pending > 0 {
+			detail += fmt.Sprintf("（采用事件时刻已生效且获知时间合规的最新决定；另有 %d 条被取代记录", superseded)
+			if pending > 0 {
+				detail += fmt.Sprintf("，%d 条未来生效暂不作用于本事件", pending)
+			}
+			detail += "）"
+		}
+		eff, learned := trustEv.EffectiveAt, trustEv.LearnedAt
 		report.Evidence = append(report.Evidence, MaterialRef{
 			Type: "trust", ID: root.ID, Label: root.Label,
-			EffectiveAt: &trustAt, LearnedAt: &trustAt,
-			Detail: map[bool]string{true: "受信任", false: "停止受信"}[trusted],
+			EffectiveAt: &eff, LearnedAt: &learned,
+			Detail: detail,
 		})
 	}
 	if !trustKnown {
@@ -370,7 +404,8 @@ func (l *Lab) evaluateChain(chain []*Cert, wantEKU x509.ExtKeyUsage, eventTime, 
 	}
 	if !trusted {
 		return StatusDisqualified, fmt.Sprintf(
-			"root %q was not a trusted anchor as of the knowledge cutoff", root.Label)
+			"root %q was not a trusted anchor at the event time (distrust effective %s, learned %s)",
+			root.Label, trustEv.EffectiveAt.Format(time.RFC3339), trustEv.LearnedAt.Format(time.RFC3339))
 	}
 	if !pol.rootAllowed(root.ID) {
 		return StatusDisqualified, fmt.Sprintf("root %q is outside this experiment's allowed roots", root.Label)

@@ -38,8 +38,21 @@ async function refresh() {
   $("#clock").textContent = fmtDate(state.now);
   renderRows(state);
   renderVerifySelect(state);
+  renderTrustLog(state);
   const history = await api("/api/history");
   renderHistory(history);
+}
+
+function renderTrustLog(state) {
+  const box = $("#trustLog");
+  const log = state.trustLog || [];
+  box.innerHTML = log.length ? "" : "<li class=\"muted\">暂无信任变化记录。</li>";
+  for (const ev of log) {
+    const li = document.createElement("li");
+    li.innerHTML = `<b>${ev.rootId}</b> ${ev.trusted ? "受信任" : "停止受信"} · 生效 ${fmtDate(ev.effectiveAt)} · 获知 ${fmtDate(ev.learnedAt)}` +
+      (new Date(ev.effectiveAt) > new Date(state.now) ? ` <span class="warn-text">（未来生效）</span>` : "");
+    box.appendChild(li);
+  }
 }
 
 function renderRows(state) {
@@ -64,6 +77,7 @@ function renderRows(state) {
     const actions = [`<button class="small danger" data-act="revoke" data-id="${c.id}">撤销</button>`];
     if (c.revoked) {
       actions.push(`<button class="small ghost" data-act="correctRevoke" data-id="${c.id}">更正撤销日期</button>`);
+      actions.push(`<button class="small ghost" data-act="retractRevoke" data-id="${c.id}">撤回撤销</button>`);
     }
     if (c.kind === "root") {
       actions.push(trusted
@@ -90,16 +104,18 @@ function renderRows(state) {
 }
 
 function renderVerifySelect(state) {
-  const sel = $("#verifyLeaf");
-  const current = sel.value;
-  sel.innerHTML = "";
-  for (const c of state.certs.filter(c => c.kind === "leaf")) {
-    const opt = document.createElement("option");
-    opt.value = c.id;
-    opt.textContent = `${c.id} (${c.ekus.join(",")})`;
-    sel.appendChild(opt);
+  for (const sel of [$("#verifyLeaf"), $("#compareLeaf")]) {
+    if (!sel) continue;
+    const current = sel.value;
+    sel.innerHTML = "";
+    for (const c of state.certs.filter(c => c.kind === "leaf")) {
+      const opt = document.createElement("option");
+      opt.value = c.id;
+      opt.textContent = `${c.id} (${c.ekus.join(",")})`;
+      sel.appendChild(opt);
+    }
+    if (current) sel.value = current;
   }
-  if (current) sel.value = current;
 }
 
 function pathArrow(step, isFirst) {
@@ -252,6 +268,57 @@ function renderHistory(history) {
   });
 }
 
+// classifyDiff attributes the conclusion difference between two reports of
+// the same event at adjacent knowledge cutoffs: trust effectiveness,
+// revocation effectiveness, or missing evidence.
+function classifyDiff(prev, cur) {
+  const tags = new Set();
+  const lo = new Date(prev.knowledgeCutoff).getTime();
+  const hi = new Date(cur.knowledgeCutoff).getTime();
+  const typeTag = { trust: "信任生效", revocation: "撤销生效", crl: "证据缺失", certificate: "证据缺失" };
+  for (const ch of cur.chains || []) {
+    for (const m of ch.evidence || []) {
+      if (!m.learnedAt) continue;
+      const t = new Date(m.learnedAt).getTime();
+      if (t > lo && t <= hi && typeTag[m.type]) tags.add(typeTag[m.type]);
+    }
+  }
+  const scan = (txt) => {
+    if (!txt) return;
+    if (/trusted anchor|信任/.test(txt)) tags.add("信任生效");
+    if (/revoked|撤销.*生效|撤回/.test(txt)) tags.add("撤销生效");
+    if (/revocation data|CRL|cover|撤销资料/.test(txt)) tags.add("证据缺失");
+  };
+  scan(cur.reason);
+  for (const ch of cur.chains || []) scan(ch.reason);
+  if (!tags.size) return "（结论差异来自既有材料的不同采用，非新增材料）";
+  return [...tags].join(" + ");
+}
+
+function verdictLabel(res) {
+  return res.status === "valid" ? "✓ 通过" : res.status === "undetermined" ? "? 尚缺依据" : "✗ 失败";
+}
+
+function renderCompareTable(results, target) {
+  const rows = results.map((res, i) => {
+    const diff = i === 0 ? "（基准）"
+      : verdictLabel(results[i - 1]) !== verdictLabel(res) || (results[i - 1].reason || "") !== (res.reason || "")
+        ? classifyDiff(results[i - 1], res)
+        : "无差异";
+    const cls = res.status === "valid" ? "ok-text" : res.status === "undetermined" ? "warn-text" : "bad-text";
+    return `<tr>
+      <td>${fmtDate(res.knowledgeCutoff)}</td>
+      <td class="${cls}"><b>${verdictLabel(res)}</b></td>
+      <td><small>${res.valid ? "路径 " + (res.selectedPath || []).join(" → ") : (res.reason || "-")}</small></td>
+      <td>${diff}</td>
+      <td>#${res.evidenceId}</td>
+    </tr>`;
+  }).join("");
+  target.innerHTML = `<table class="compare-table">
+    <thead><tr><th>获知截止</th><th>结论</th><th>依据</th><th>与上一截止的差异来源</th><th>证据</th></tr></thead>
+    <tbody>${rows}</tbody></table>`;
+}
+
 function bindForms() {
   $("#rootForm").addEventListener("submit", async e => {
     e.preventDefault();
@@ -330,15 +397,29 @@ function bindForms() {
     try {
       switch (btn.dataset.act) {
         case "revoke":
-          if (!confirm(`确认撤销 ${id}？下次验证立即生效。`)) return;
-          await api(`/api/certs/${id}/revoke`, { method: "POST", body: "{}" });
-          toast("已标记撤销"); break;
+          {
+            const v = prompt(`确认撤销 ${id}？可填撤销生效时间（RFC3339，留空=现在）。\n填过去的时间表示“晚到的撤销材料”：现在才获知、但更早已生效。`, "");
+            if (v === null) return;
+            await api(`/api/certs/${id}/revoke`, { method: "POST", body: JSON.stringify({ revokedAt: v.trim() }) });
+            toast(v.trim() ? "已登记晚到的撤销材料（获知时间=现在）" : "已标记撤销");
+          }
+          break;
         case "trust":
-          await api(`/api/certs/${id}/trust`, { method: "POST", body: JSON.stringify({ trusted: true }) });
-          toast("已设为信任锚点（规则版本已更新）"); break;
+          {
+            const v = prompt("信任生效时间（RFC3339，留空=立即；填未来时间表示提前获知、未来生效）", "");
+            if (v === null) return;
+            await api(`/api/certs/${id}/trust`, { method: "POST", body: JSON.stringify({ trusted: true, effectiveAt: v.trim() }) });
+            toast("已设为信任锚点（规则版本已更新）");
+          }
+          break;
         case "distrust":
-          await api(`/api/certs/${id}/trust`, { method: "POST", body: JSON.stringify({ trusted: false }) });
-          toast("已取消信任（规则版本已更新）"); break;
+          {
+            const v = prompt("停止受信的生效时间（RFC3339，留空=立即；填未来时间表示提前获知、未来生效）", "");
+            if (v === null) return;
+            await api(`/api/certs/${id}/trust`, { method: "POST", body: JSON.stringify({ trusted: false, effectiveAt: v.trim() }) });
+            toast("已取消信任（规则版本已更新）");
+          }
+          break;
         case "crlOn":
           await api(`/api/certs/${id}/crl`, { method: "POST", body: JSON.stringify({ published: true }) });
           toast("已恢复 CRL 发布"); break;
@@ -359,7 +440,37 @@ function bindForms() {
           toast("已追加更正撤销记录（旧记录保留）");
           break;
         }
+        case "retractRevoke": {
+          const v = prompt("撤回说明（可空）：撤回后新调查不再视为撤销，旧调查结论不变", "");
+          if (v === null) return;
+          await api(`/api/certs/${id}/retractrevoke`, { method: "POST", body: JSON.stringify({ note: v.trim() }) });
+          toast("已追加撤回记录（旧撤销记录保留）");
+          break;
+        }
       }
+      refresh();
+    } catch (err) { toast(err.message, false); }
+  });
+
+  $("#compareForm").addEventListener("submit", async e => {
+    e.preventDefault();
+    const leafId = $("#compareLeaf").value;
+    const purpose = e.target.elements.purpose.value;
+    const eventTime = new Date(e.target.elements.eventTime.value).toISOString();
+    const cutoffs = e.target.elements.cutoffs.value.split(/[，,\n]/).map(s => s.trim()).filter(Boolean)
+      .map(s => new Date(s)).filter(d => !isNaN(d))
+      .sort((a, b) => a - b).map(d => d.toISOString());
+    if (!cutoffs.length) { toast("请填写至少一个有效的获知截止", false); return; }
+    try {
+      const results = [];
+      for (const knowledgeCutoff of cutoffs) {
+        results.push(await api("/api/verify", {
+          method: "POST",
+          body: JSON.stringify({ leafId, purpose, eventTime, knowledgeCutoff }),
+        }));
+      }
+      renderCompareTable(results, $("#compareResult"));
+      toast(`已生成 ${results.length} 份对照报告（各自保存为独立证据）`);
       refresh();
     } catch (err) { toast(err.message, false); }
   });

@@ -20,20 +20,26 @@ type Lab struct {
 	mu           sync.RWMutex
 	seq          atomic.Uint64
 	certs        map[string]*Cert
-	trust        map[string]bool // logical root IDs currently trusted
-	trustLog     []TrustEvent    // append-only learned trust changes
+	trustLog     []TrustEvent // append-only learned trust changes
 	nowFunc      func() time.Time
 	history      []*VerifyResult
 	rulesVersion int
+	storePath    string
 }
 
 func NewLab() *Lab {
 	return &Lab{
 		certs:        map[string]*Cert{},
-		trust:        map[string]bool{},
 		nowFunc:      time.Now,
 		rulesVersion: 1,
 	}
+}
+
+// persist saves a snapshot when a store is configured. Every mutation
+// funnels through here so a saved lab always reflects the latest state;
+// persistence failures never break an experiment in progress.
+func (l *Lab) persist() {
+	_ = l.saveLocked()
 }
 
 func (l *Lab) Now() time.Time { return l.nowFunc() }
@@ -79,9 +85,11 @@ func (l *Lab) AddRoot(id, cn string, years int) (*Cert, error) {
 	c.CRLKnownAt = now.UTC()
 	c.LearnedAt = now.UTC()
 	l.put(c)
-	l.trust[id] = true
-	l.trustLog = append(l.trustLog, TrustEvent{RootID: id, Trusted: true, LearnedAt: now.UTC()})
+	l.trustLog = append(l.trustLog, TrustEvent{
+		RootID: id, Trusted: true, EffectiveAt: now.UTC(), LearnedAt: now.UTC(),
+	})
 	l.rulesVersion++
+	l.persist()
 	return c, nil
 }
 
@@ -120,6 +128,7 @@ func (l *Lab) AddIntermediate(id, cn, issuerID, crossSubjectID string, years int
 	c.CRLKnownAt = now.UTC()
 	c.LearnedAt = now.UTC()
 	l.put(c)
+	l.persist()
 	return c, nil
 }
 
@@ -169,6 +178,7 @@ func (l *Lab) addLeafLocked(id, cn, issuerID string, ekus []EKU, dnsNames []stri
 	}
 	c.LearnedAt = now.UTC()
 	l.put(c)
+	l.persist()
 	return c, nil
 }
 
@@ -213,40 +223,73 @@ func (l *Lab) RotateLeaf(newID, leafID, newIssuerID string, days int) (*Cert, er
 	return l.addLeafLocked(newID, newCN, newIssuerID, ekus, old.Cert.DNSNames, days)
 }
 
-// SetTrust marks a root as trusted (anchor) or distrusted. Old and new roots
-// can coexist during migration so both chains validate until cut-over.
-// Changing trust is a rules change and bumps the rules version.
+// SetTrust marks a root as trusted (anchor) or distrusted, effective now.
 func (l *Lab) SetTrust(rootID string, trusted bool) error {
+	return l.SetTrustAt(rootID, trusted, time.Time{})
+}
+
+// SetTrustAt registers a trust decision learned now but taking effect at
+// effectiveAt (zero means immediately). A future effectiveAt models a
+// decision the lab already knows about but which only applies later; a
+// historical event before that moment is still judged under the previous
+// trust state. Changing trust is a rules change and bumps the version.
+func (l *Lab) SetTrustAt(rootID string, trusted bool, effectiveAt time.Time) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	c, ok := l.certs[rootID]
 	if !ok || c.Kind != KindRoot {
 		return fmt.Errorf("root %q not found", rootID)
 	}
-	if l.trust[rootID] != trusted {
-		l.trust[rootID] = trusted
+	now := l.nowFunc().UTC()
+	if effectiveAt.IsZero() {
+		effectiveAt = now
+	}
+	effectiveAt = effectiveAt.UTC()
+	if cur, _, known := l.trustedAtLocked(rootID, now, now); !known || cur != trusted || effectiveAt.After(now) {
 		l.trustLog = append(l.trustLog, TrustEvent{
-			RootID: rootID, Trusted: trusted, LearnedAt: l.nowFunc().UTC(),
+			RootID: rootID, Trusted: trusted, EffectiveAt: effectiveAt, LearnedAt: now,
 		})
 		l.rulesVersion++
+		l.persist()
 	}
 	return nil
 }
 
-// trustedAtLocked reconstructs the trust status of rootID as known at the
-// knowledge cutoff, using only trust events learned on or before it. The
-// third return value reports whether any trust decision is known at all.
-func (l *Lab) trustedAtLocked(rootID string, cutoff time.Time) (bool, time.Time, bool) {
-	var trusted bool
-	var at time.Time
+// trustedAtLocked reconstructs the trust status of rootID effective at
+// asOf, using only trust events learned on or before the knowledge cutoff.
+// The two clocks stay separate: a distrust learned before the cutoff but
+// effective after asOf does not apply. The returned event is the adopted
+// decision; the boolean reports whether any applicable decision is known.
+func (l *Lab) trustedAtLocked(rootID string, asOf, cutoff time.Time) (bool, TrustEvent, bool) {
+	var adopted TrustEvent
 	known := false
+	for _, ev := range l.trustLog {
+		if ev.RootID != rootID || ev.LearnedAt.After(cutoff) || ev.EffectiveAt.After(asOf) {
+			continue
+		}
+		if !known || ev.EffectiveAt.After(adopted.EffectiveAt) ||
+			(ev.EffectiveAt.Equal(adopted.EffectiveAt) && ev.LearnedAt.After(adopted.LearnedAt)) {
+			adopted, known = ev, true
+		}
+	}
+	return adopted.Trusted, adopted, known
+}
+
+// trustConflictsLocked counts the other same-root trust decisions known at
+// the cutoff that were not adopted for asOf, so reports can explain the
+// adoption basis instead of silently overwriting.
+func (l *Lab) trustConflictsLocked(rootID string, asOf, cutoff time.Time, adopted TrustEvent) (superseded, pending int) {
 	for _, ev := range l.trustLog {
 		if ev.RootID != rootID || ev.LearnedAt.After(cutoff) {
 			continue
 		}
-		trusted, at, known = ev.Trusted, ev.LearnedAt, true
+		if ev.EffectiveAt.After(asOf) {
+			pending++
+		} else if ev != adopted {
+			superseded++
+		}
 	}
-	return trusted, at, known
+	return superseded, pending
 }
 
 // TrustLog returns the append-only trust decision history, oldest first.
@@ -262,8 +305,12 @@ func (l *Lab) TrustedRoots() []string {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	var ids []string
-	for id, ok := range l.trust {
-		if ok {
+	now := l.nowFunc().UTC()
+	for id, c := range l.certs {
+		if c.Kind != KindRoot {
+			continue
+		}
+		if trusted, _, known := l.trustedAtLocked(id, now, now); known && trusted {
 			ids = append(ids, id)
 		}
 	}
@@ -277,10 +324,43 @@ func (l *Lab) RulesVersion() int {
 	return l.rulesVersion
 }
 
-// Revoke marks a certificate revoked as of now. The claim is appended to
-// the certificate's revocation log with the current time as both the
-// effective and the learned time; the next live verification sees it.
+// Revoke marks a certificate revoked as of now.
 func (l *Lab) Revoke(id string) error {
+	return l.RevokeAt(id, time.Time{})
+}
+
+// RevokeAt appends a revocation claim learned now with the given effective
+// time (zero means now). A past revokedAt models late-arriving revocation
+// material: the lab only learns today that the certificate was already
+// revoked earlier, so investigations with an earlier knowledge cutoff stay
+// reproducible while new ones see the backdated effect.
+func (l *Lab) RevokeAt(id string, revokedAt time.Time) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	c, ok := l.certs[id]
+	if !ok {
+		return fmt.Errorf("cert %q not found", id)
+	}
+	now := l.nowFunc().UTC()
+	if revokedAt.IsZero() {
+		revokedAt = now
+	}
+	revokedAt = revokedAt.UTC()
+	c.Revoked = true
+	c.RevokedAt = revokedAt
+	c.Revocations = append(c.Revocations, RevocationRecord{
+		RevokedAt: revokedAt, LearnedAt: now,
+	})
+	l.persist()
+	return nil
+}
+
+// RetractRevocation appends a withdrawal of the earlier revocation claims:
+// the source now states the certificate is not revoked. Earlier claims stay
+// in the append-only log, so investigations with a knowledge cutoff before
+// the retraction still conclude "revoked", and only new investigations see
+// the withdrawal.
+func (l *Lab) RetractRevocation(id, note string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	c, ok := l.certs[id]
@@ -288,12 +368,19 @@ func (l *Lab) Revoke(id string) error {
 		return fmt.Errorf("cert %q not found", id)
 	}
 	if !c.Revoked {
-		c.Revoked = true
-		c.RevokedAt = l.nowFunc().UTC()
-		c.Revocations = append(c.Revocations, RevocationRecord{
-			RevokedAt: c.RevokedAt, LearnedAt: c.RevokedAt,
-		})
+		return fmt.Errorf("cert %q is not revoked; nothing to retract", id)
 	}
+	now := l.nowFunc().UTC()
+	if note == "" {
+		note = "revocation claim retracted"
+	}
+	c.Revocations = append(c.Revocations, RevocationRecord{
+		RevokedAt: now, LearnedAt: now, Note: note, Retracted: true,
+	})
+	c.Revoked = false
+	c.RevokedAt = time.Time{}
+	l.rulesVersion++
+	l.persist()
 	return nil
 }
 
@@ -318,12 +405,15 @@ func (l *Lab) CorrectRevocation(id string, revokedAt time.Time) error {
 	})
 	c.RevokedAt = revokedAt.UTC()
 	l.rulesVersion++
+	l.persist()
 	return nil
 }
 
 // revocationAtLocked returns the latest revocation claim learned on or
-// before the knowledge cutoff. The boolean reports whether any claim is
-// known at all at that cutoff.
+// before the knowledge cutoff. The boolean reports whether a revocation is
+// in effect at that cutoff: a retraction claim known at the cutoff means
+// the certificate counts as not revoked (while the earlier claims remain
+// visible to older investigations).
 func revocationAtLocked(c *Cert, cutoff time.Time) (RevocationRecord, bool) {
 	var rec RevocationRecord
 	known := false
@@ -335,7 +425,24 @@ func revocationAtLocked(c *Cert, cutoff time.Time) (RevocationRecord, bool) {
 			rec, known = r, true
 		}
 	}
+	if known && rec.Retracted {
+		return rec, false
+	}
 	return rec, known
+}
+
+// revocationClaimsLocked lists every revocation-related claim (including
+// corrections and retractions) learned on or before the cutoff, oldest
+// first, so reports can explain which claim was adopted and what
+// conflicting same-source material exists.
+func revocationClaimsLocked(c *Cert, cutoff time.Time) []RevocationRecord {
+	var out []RevocationRecord
+	for _, r := range c.Revocations {
+		if !r.LearnedAt.After(cutoff) {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // SetCRLPublished controls whether a CA publishes revocation data. Turning
@@ -357,6 +464,7 @@ func (l *Lab) SetCRLPublished(caID string, published bool) error {
 			c.CRLKnownAt = l.nowFunc().UTC()
 		}
 		l.rulesVersion++
+		l.persist()
 	}
 	return nil
 }
@@ -381,6 +489,7 @@ func (l *Lab) SetCRLDelay(caID string, minutes int) error {
 	if c.CRLDelayMin != minutes {
 		c.CRLDelayMin = minutes
 		l.rulesVersion++
+		l.persist()
 	}
 	return nil
 }
@@ -451,9 +560,9 @@ func (l *Lab) Reset() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.certs = map[string]*Cert{}
-	l.trust = map[string]bool{}
 	l.trustLog = nil
 	l.history = nil
 	l.seq.Store(0)
 	l.rulesVersion = 1
+	l.persist()
 }

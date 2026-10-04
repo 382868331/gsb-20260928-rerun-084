@@ -73,6 +73,9 @@
           <tbody id="certRows"></tbody>
         </table>
       </div>
+      <details class="materials"><summary>信任变化记录（生效时间 / 获知时间）</summary>
+        <ul id="trustLog"></ul>
+      </details>
     </section>
 
     <section class="panel">
@@ -94,6 +97,23 @@
         <span class="hint">事件时刻=要研究的过去时刻；获知截止=只使用此前已取得的材料。留空均为现在。以上偏好仅作用于下一次验证，并随证据保存，便于比较选择变化。</span>
       </form>
       <div id="verifyResult" class="result"></div>
+    </section>
+
+    <section class="panel">
+      <h2>多获知截止对照</h2>
+      <p class="hint">对同一事件时刻，用多个获知截止分别生成对照报告（每个截止都会保存为新证据），
+        并标出结论差异来自信任生效、撤销生效还是证据缺失。获知截止一行一个或逗号分隔，格式如 2026-10-01T12:00。</p>
+      <form id="compareForm" class="inline">
+        <select name="leafId" id="compareLeaf" required></select>
+        <select name="purpose">
+          <option value="serverAuth">serverAuth</option>
+          <option value="clientAuth">clientAuth</option>
+        </select>
+        <label class="check">事件时刻 <input type="datetime-local" name="eventTime" step="60" required /></label>
+        <input name="cutoffs" placeholder="获知截止列表，逗号分隔" size="40" required />
+        <button>生成对照报告</button>
+      </form>
+      <div id="compareResult" class="result"></div>
     </section>
 
     <section class="panel">

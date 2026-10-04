@@ -90,6 +90,120 @@ func TestSampleScenariosOverHTTP(t *testing.T) {
 	}
 }
 
+// The three page experiments, driven through the real HTTP API the page
+// calls: future-effective trust, late-arriving revocation material and
+// corrective material. Each checks that saved reports are frozen and that
+// only new comparison reports reflect the new materials.
+func TestThreeExperimentsOverHTTP(t *testing.T) {
+	_, h := newHarness(t)
+	verify := func(leaf, event, cutoff, allowed string) map[string]any {
+		t.Helper()
+		body := `{"leafId":"` + leaf + `","purpose":"serverAuth","policy":{"allowedRoots":[` + allowed + `]}`
+		if event != "" {
+			body += `,"eventTime":"` + event + `"`
+		}
+		if cutoff != "" {
+			body += `,"knowledgeCutoff":"` + cutoff + `"`
+		}
+		body += "}"
+		code, res := do(t, h, "POST", "/api/verify", body)
+		if code != http.StatusOK {
+			t.Fatalf("verify %s: %d %v", leaf, code, res)
+		}
+		return res
+	}
+	rfc := func(d time.Duration) string { return time.Now().Add(d).UTC().Format(time.RFC3339) }
+
+	// Experiment 1: distrust learned now but only effective in two hours.
+	code, _ := do(t, h, "POST", "/api/certs/rootA/trust",
+		`{"trusted":false,"effectiveAt":"`+rfc(2*time.Hour)+`"}`)
+	if code != http.StatusOK {
+		t.Fatalf("future-effective trust: %d", code)
+	}
+	before := verify("leaf-ok", rfc(time.Hour), rfc(30*time.Minute), `"rootA"`)
+	if before["valid"] != true {
+		t.Fatalf("future-effective distrust must not apply to earlier events: %v", before["reason"])
+	}
+	after := verify("leaf-ok", rfc(3*time.Hour), rfc(3*time.Hour), `"rootA"`)
+	if after["valid"] != false || after["status"] != "disqualified" {
+		t.Fatalf("once effective the distrust must disqualify: %v %v", after["valid"], after["reason"])
+	}
+
+	// Experiment 2: revocation material learned late, effective earlier.
+	// The frozen cutoff is captured before the revocation arrives.
+	event2 := rfc(90 * time.Second)
+	frozenCutoff := rfc(time.Second)
+	oldView := verify("leaf-rotated", event2, frozenCutoff, `"rootA","rootB"`)
+	if oldView["valid"] != true {
+		t.Fatalf("baseline must validate: %v", oldView["reason"])
+	}
+	time.Sleep(2500 * time.Millisecond)
+	code, _ = do(t, h, "POST", "/api/certs/leaf-rotated/revoke",
+		`{"revokedAt":"`+rfc(60*time.Second)+`"}`)
+	if code != http.StatusOK {
+		t.Fatalf("late revoke: %d", code)
+	}
+	newView := verify("leaf-rotated", event2, rfc(3*time.Minute), `"rootA","rootB"`)
+	if newView["valid"] != false || newView["status"] != "disqualified" {
+		t.Fatalf("backdated revocation must disqualify: %v %v", newView["valid"], newView["reason"])
+	}
+	frozen := verify("leaf-rotated", event2, frozenCutoff, `"rootA","rootB"`)
+	if frozen["valid"] != true {
+		t.Fatalf("old cutoff must still reproduce the old conclusion: %v", frozen["reason"])
+	}
+
+	// Experiment 3: corrective revocation material with conflict note.
+	code, _ = do(t, h, "POST", "/api/certs/leaf-loop/revoke", `{}`)
+	if code != http.StatusOK {
+		t.Fatalf("revoke: %d", code)
+	}
+	event3 := rfc(5 * time.Minute)
+	// A cutoff after the revocation was learned but before the correction
+	// arrives must keep reproducing the pre-correction conclusion.
+	cutoffA := rfc(1500 * time.Millisecond)
+	wrong := verify("leaf-loop", event3, cutoffA, `"rootE"`)
+	if wrong["valid"] != false {
+		t.Fatalf("revoked leaf must fail: %v", wrong)
+	}
+	time.Sleep(2 * time.Second)
+	code, _ = do(t, h, "POST", "/api/certs/leaf-loop/correctrevoke",
+		`{"revokedAt":"`+rfc(10*time.Minute)+`"}`)
+	if code != http.StatusOK {
+		t.Fatalf("correctrevoke: %d", code)
+	}
+	corrected := verify("leaf-loop", event3, rfc(3*time.Minute), `"rootE"`)
+	if corrected["valid"] != true {
+		t.Fatalf("correction moves the effect past the event: %v", corrected["reason"])
+	}
+	foundConflict := false
+	for _, ch := range corrected["chains"].([]any) {
+		ev, _ := ch.(map[string]any)["evidence"].([]any)
+		for _, m := range ev {
+			mm := m.(map[string]any)
+			if mm["type"] == "revocation" && strings.Contains(mm["detail"].(string), "同源撤销记录") {
+				foundConflict = true
+			}
+		}
+	}
+	if !foundConflict {
+		t.Fatal("report must explain the conflicting same-source claims and the adoption basis")
+	}
+
+	// Retraction only affects new investigations.
+	code, _ = do(t, h, "POST", "/api/certs/leaf-loop/retractrevoke", `{"note":"withdrawn"}`)
+	if code != http.StatusOK {
+		t.Fatalf("retractrevoke: %d", code)
+	}
+	retracted := verify("leaf-loop", event3, rfc(4*time.Minute), `"rootE"`)
+	if retracted["valid"] != true {
+		t.Fatalf("retracted revocation must clear new investigations: %v", retracted["reason"])
+	}
+	stillWrong := verify("leaf-loop", event3, cutoffA, `"rootE"`)
+	if stillWrong["valid"] != false {
+		t.Fatal("cutoff before the correction and retraction must keep the old conclusion")
+	}
+}
+
 func TestHistoryAndCRLAndIndex(t *testing.T) {
 	_, h := newHarness(t)
 	doVerify(t, h, "leaf-ok")

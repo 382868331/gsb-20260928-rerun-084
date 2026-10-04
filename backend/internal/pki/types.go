@@ -69,15 +69,24 @@ type RevocationRecord struct {
 	RevokedAt time.Time `json:"revokedAt"`
 	LearnedAt time.Time `json:"learnedAt"`
 	Note      string    `json:"note,omitempty"`
+	// Retracted marks a withdrawal of earlier revocation claims: the
+	// source tells the lab the certificate is not revoked after all.
+	// Earlier records stay in the log, so investigations with a cutoff
+	// before the retraction still see the revocation.
+	Retracted bool `json:"retracted,omitempty"`
 }
 
-// TrustEvent is one learned change of a root's trust status. The log lets
-// a historical investigation reconstruct which roots were trusted as of a
-// knowledge cutoff instead of using today's trust set.
+// TrustEvent is one learned change of a root's trust status. EffectiveAt
+// is when the decision takes effect (it may be backdated or scheduled in
+// the future); LearnedAt is when the lab obtained the decision. A
+// historical investigation evaluates trust at the event time using only
+// decisions learned on or before the knowledge cutoff, so a distrust that
+// became effective after the event never poisons the event's review.
 type TrustEvent struct {
-	RootID    string    `json:"rootId"`
-	Trusted   bool      `json:"trusted"`
-	LearnedAt time.Time `json:"learnedAt"`
+	RootID      string    `json:"rootId"`
+	Trusted     bool      `json:"trusted"`
+	EffectiveAt time.Time `json:"effectiveAt"`
+	LearnedAt   time.Time `json:"learnedAt"`
 }
 
 // EncodePEM renders a DER certificate as PEM text.

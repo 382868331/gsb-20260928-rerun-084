@@ -194,7 +194,25 @@ func (s *Server) handleCertAction(w http.ResponseWriter, r *http.Request) {
 	}
 	switch action {
 	case "revoke":
-		if err := s.lab.Revoke(id); err != nil {
+		var body struct{ RevokedAt string }
+		if r.ContentLength != 0 && !decode(w, r, &body) {
+			return
+		}
+		at, err := parseTimeOpt(body.RevokedAt)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		if err := s.lab.RevokeAt(id, at); err != nil {
+			writeErr(w, err)
+			return
+		}
+	case "retractrevoke":
+		var body struct{ Note string }
+		if r.ContentLength != 0 && !decode(w, r, &body) {
+			return
+		}
+		if err := s.lab.RetractRevocation(id, body.Note); err != nil {
 			writeErr(w, err)
 			return
 		}
@@ -213,11 +231,19 @@ func (s *Server) handleCertAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	case "trust":
-		var body struct{ Trusted bool }
+		var body struct {
+			Trusted     bool
+			EffectiveAt string `json:"effectiveAt"`
+		}
 		if r.ContentLength != 0 && !decode(w, r, &body) {
 			return
 		}
-		if err := s.lab.SetTrust(id, body.Trusted); err != nil {
+		at, err := parseTimeOpt(body.EffectiveAt)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		if err := s.lab.SetTrustAt(id, body.Trusted, at); err != nil {
 			writeErr(w, err)
 			return
 		}
