@@ -38,8 +38,35 @@ async function refresh() {
   $("#clock").textContent = fmtDate(state.now);
   renderRows(state);
   renderVerifySelect(state);
+  renderTrustLog(state);
   const history = await api("/api/history");
   renderHistory(history);
+}
+
+const CAUSE_LABELS = {
+  trust: "信任生效",
+  revocation: "撤销生效",
+  "missing-evidence": "证据缺失",
+  expiry: "期限",
+  purpose: "用途",
+  signature: "签名",
+  policy: "实验策略",
+};
+
+function causeLabel(cause) {
+  return cause ? (CAUSE_LABELS[cause] || cause) : "";
+}
+
+function renderTrustLog(state) {
+  const box = $("#trustLog");
+  box.innerHTML = "";
+  for (const ev of state.trustLog || []) {
+    const li = document.createElement("li");
+    li.textContent = ev.rootId + " → " + (ev.trusted ? "受信任" : "停止受信") +
+      " · 生效 " + fmtDate(ev.effectiveAt) + " · 获知 " + fmtDate(ev.learnedAt);
+    box.appendChild(li);
+  }
+  if (!box.children.length) box.innerHTML = "<li class='muted'>暂无信任决定。</li>";
 }
 
 function renderRows(state) {
@@ -58,17 +85,20 @@ function renderRows(state) {
     if (c.kind !== "leaf" && c.crlDelayMin > 0) status.push(`<span class="warn-text">撤销资料迟到 ${c.crlDelayMin} 分钟</span>`);
     status.push(`<span class="muted">取得于 ${fmtDate(c.learnedAt)}</span>`);
     for (const rec of c.revocations || []) {
-      status.push(`<span class="muted">撤销记录：生效 ${fmtDate(rec.revokedAt)} · 获知 ${fmtDate(rec.learnedAt)}${rec.note ? " · " + rec.note : ""}</span>`);
+      const kind = rec.retracted ? "撤回撤销" : "撤销记录";
+      status.push(`<span class="muted">${kind}：生效 ${fmtDate(rec.revokedAt)} · 获知 ${fmtDate(rec.learnedAt)}${rec.note ? " · " + rec.note : ""}</span>`);
     }
 
     const actions = [`<button class="small danger" data-act="revoke" data-id="${c.id}">撤销</button>`];
     if (c.revoked) {
+      actions.push(`<button class="small ghost" data-act="retractRevoke" data-id="${c.id}">撤回撤销</button>`);
       actions.push(`<button class="small ghost" data-act="correctRevoke" data-id="${c.id}">更正撤销日期</button>`);
     }
     if (c.kind === "root") {
       actions.push(trusted
         ? `<button class="small warn" data-act="distrust" data-id="${c.id}">取消信任</button>`
         : `<button class="small" data-act="trust" data-id="${c.id}">设为信任</button>`);
+      actions.push(`<button class="small ghost" data-act="scheduleTrust" data-id="${c.id}">预约信任变化</button>`);
     }
     if (c.kind !== "leaf") {
       actions.push(c.crlPublished
@@ -90,16 +120,17 @@ function renderRows(state) {
 }
 
 function renderVerifySelect(state) {
-  const sel = $("#verifyLeaf");
-  const current = sel.value;
-  sel.innerHTML = "";
-  for (const c of state.certs.filter(c => c.kind === "leaf")) {
-    const opt = document.createElement("option");
-    opt.value = c.id;
-    opt.textContent = `${c.id} (${c.ekus.join(",")})`;
-    sel.appendChild(opt);
+  for (const sel of [$("#verifyLeaf"), $("#compareLeaf")]) {
+    const current = sel.value;
+    sel.innerHTML = "";
+    for (const c of state.certs.filter(c => c.kind === "leaf")) {
+      const opt = document.createElement("option");
+      opt.value = c.id;
+      opt.textContent = `${c.id} (${c.ekus.join(",")})`;
+      sel.appendChild(opt);
+    }
+    if (current) sel.value = current;
   }
-  if (current) sel.value = current;
 }
 
 function pathArrow(step, isFirst) {
@@ -124,7 +155,8 @@ function renderResult(res, target) {
   const selected = (res.selectedPath || []).join(" → ");
   target.innerHTML = `
     <div class="verdict ${verdictClass}">` +
-      `${statusText[res.status] || (res.valid ? statusText.valid : statusText.disqualified)} · 证书 ${res.leafId} · 用途 ${res.purpose} · 证据 #${res.evidenceId} · 规则版本 ${res.rulesVersion}</div>
+      `${statusText[res.status] || (res.valid ? statusText.valid : statusText.disqualified)} · 证书 ${res.leafId} · 用途 ${res.purpose} · 证据 #${res.evidenceId} · 规则版本 ${res.rulesVersion}` +
+      (res.cause ? ` · 决定因素：${causeLabel(res.cause)}` : "") + `</div>
     <div class="muted">${res.valid ? "实际采用路径：" + selected : "结论依据：" + (res.reason || "-")}</div>
     <div class="muted">事件时刻 ${fmtDate(res.eventTime)} · 获知截止 ${fmtDate(res.knowledgeCutoff)} · 检查时间 ${fmtDate(res.checkedAt)}</div>
     <div class="muted">当时受信任根：${(res.trustedRoots || []).join(", ") || "（无）"}</div>
@@ -133,6 +165,7 @@ function renderResult(res, target) {
       <div class="chain ${ch.status === "valid" ? "ok" : ch.status === "undetermined" ? "warn" : "bad"}">
         <b>${chainLabel(ch, selected)}</b>
         ${ch.reason ? ` <span class="${ch.status === "undetermined" ? "warn-text" : "bad-text"}">— ${ch.reason}</span>` : ` <span class="ok-text">— 签名、期限、用途、锚点与撤销资料均满足</span>`}
+        ${ch.cause ? ` <span class="muted">[${causeLabel(ch.cause)}]</span>` : ""}
         ${ch.path.map((s, i) => pathArrow(s, i === 0)).join("")}
         ${renderEvidence(ch)}
       </div>`).join("")}`;
@@ -184,7 +217,7 @@ function renderCompare(prev, cur) {
   if (prev.eventTime !== cur.eventTime) lines.push(`事件时刻移动：${fmtDate(prev.eventTime)} → ${fmtDate(cur.eventTime)}`);
   if (prev.knowledgeCutoff !== cur.knowledgeCutoff) lines.push(`获知截止变化（新增知识）：${fmtDate(prev.knowledgeCutoff)} → ${fmtDate(cur.knowledgeCutoff)}`);
   const label = r => r.status === "valid" ? "✓ 通过" : r.status === "undetermined" ? "? 尚缺依据" : "✗ 失败";
-  if (label(prev) !== label(cur)) lines.push(`结论：${label(prev)} → ${label(cur)}`);
+  if (label(prev) !== label(cur)) lines.push(`结论：${label(prev)} → ${label(cur)}` + (cur.cause ? `（决定因素：${causeLabel(cur.cause)}）` : ""));
   const polStr = p => {
     const bits = [];
     if (((p || {}).allowedRoots || []).length) bits.push("允许根[" + p.allowedRoots.join(",") + "]");
@@ -232,6 +265,7 @@ function renderHistory(history) {
       <summary>
         <span class="${res.status === "valid" ? "ok-text" : res.status === "undetermined" ? "warn-text" : "bad-text"}"><b>${res.status === "valid" ? "✓ 通过" : res.status === "undetermined" ? "? 尚缺依据" : "✗ 失败"}</b></span>
         证据 #${res.evidenceId} · 规则 v${res.rulesVersion} · ${res.leafId} · ${res.purpose} · ${fmtDate(res.checkedAt)}
+        ${res.cause ? ` · 决定因素：${causeLabel(res.cause)}` : ""}
         <br><small class="muted">事件时刻 ${fmtDate(res.eventTime)} · 获知截止 ${fmtDate(res.knowledgeCutoff)}</small>
         ${res.valid ? ` · 路径 ${(res.selectedPath || []).join(" → ")}` : ` · ${res.reason}`}
         <button class="small ghost" data-export="${res.evidenceId}">导出</button>
@@ -330,9 +364,29 @@ function bindForms() {
     try {
       switch (btn.dataset.act) {
         case "revoke":
-          if (!confirm(`确认撤销 ${id}？下次验证立即生效。`)) return;
-          await api(`/api/certs/${id}/revoke`, { method: "POST", body: "{}" });
-          toast("已标记撤销"); break;
+          {
+            const at = prompt("撤销生效时间（RFC3339；留空=现在。填过去时间表示晚到的撤销材料）", "");
+            if (at === null) return;
+            await api(`/api/certs/${id}/revoke`, { method: "POST", body: JSON.stringify({ revokedAt: at.trim() }) });
+            toast(at.trim() ? "已登记晚到撤销材料（获知时间为现在）" : "已标记撤销");
+            break;
+          }
+        case "retractRevoke": {
+          const note = prompt("撤回说明（留空使用默认）", "");
+          if (note === null) return;
+          await api(`/api/certs/${id}/retractrevoke`, { method: "POST", body: JSON.stringify({ note }) });
+          toast("已追加撤回记录（旧撤销记录保留）");
+          break;
+        }
+        case "scheduleTrust": {
+          const at = prompt("信任变化生效时间（RFC3339，可为未来；获知时间为现在）");
+          if (!at) return;
+          const decision = prompt("生效后是否信任该根？（yes/no）", "no");
+          if (decision === null) return;
+          await api(`/api/certs/${id}/trust`, { method: "POST", body: JSON.stringify({ trusted: /^y/i.test(decision), effectiveAt: at.trim() }) });
+          toast("已预约信任变化（获知时间=现在，生效时间=" + at.trim() + "）");
+          break;
+        }
         case "trust":
           await api(`/api/certs/${id}/trust`, { method: "POST", body: JSON.stringify({ trusted: true }) });
           toast("已设为信任锚点（规则版本已更新）"); break;
@@ -377,6 +431,79 @@ function bindForms() {
     $("#verifyResult").innerHTML = "";
     refresh();
   });
+
+  $("#compareForm").addEventListener("submit", async e => {
+    e.preventDefault();
+    const leafId = $("#compareLeaf").value;
+    const purpose = e.target.elements.purpose.value;
+    const evVal = e.target.elements.eventTime.value;
+    if (!evVal) { toast("请填写事件时刻", false); return; }
+    const eventTime = new Date(evVal).toISOString();
+    let cutoffs = (e.target.elements.cutoffs.value || "")
+      .split(",").map(s => s.trim()).filter(Boolean)
+      .map(s => new Date(s).toISOString());
+    if (!cutoffs.length) {
+      const history = await api("/api/history");
+      const set = new Set();
+      for (const h of history) {
+        if (h.leafId !== leafId || h.purpose !== purpose) continue;
+        if (Math.abs(new Date(h.eventTime) - new Date(eventTime)) > 60 * 1000) continue;
+        set.add(h.knowledgeCutoff);
+      }
+      cutoffs = [...set];
+    }
+    if (!cutoffs.length) { toast("请填写获知截止，或先对该事件产生历史证据", false); return; }
+    cutoffs.sort();
+    try {
+      const rows = [];
+      for (const c of cutoffs) {
+        rows.push(await api("/api/verify", {
+          method: "POST",
+          body: JSON.stringify({ leafId, purpose, eventTime, knowledgeCutoff: c }),
+        }));
+      }
+      renderCutoffCompare(rows, $("#compareResult"));
+      toast("对照报告已生成（每次复查均为新证据，旧证据不变）");
+      refresh();
+    } catch (err) { toast(err.message, false); }
+  });
+}
+
+function verdictLabel(res) {
+  return res.status === "valid" ? "✓ 通过" : res.status === "undetermined" ? "? 尚缺依据" : "✗ 失败";
+}
+
+// renderCutoffCompare shows one event re-examined at several knowledge
+// cutoffs and attributes each conclusion change to trust taking effect,
+// revocation taking effect or missing evidence.
+function renderCutoffCompare(rows, target) {
+  const body = rows.map((res, i) => {
+    let diff = "（首个截止）";
+    if (i > 0) {
+      const prev = rows[i - 1];
+      if (verdictLabel(prev) === verdictLabel(res)) {
+        diff = "无结论差异";
+      } else {
+        const cause = causeLabel(res.cause) || "其他";
+        diff = `${verdictLabel(prev)} → ${verdictLabel(res)}：差异来自${cause}`;
+      }
+    }
+    const cls = res.status === "valid" ? "ok-text" : res.status === "undetermined" ? "warn-text" : "bad-text";
+    return `<tr>
+      <td>${fmtDate(res.knowledgeCutoff)}</td>
+      <td class="${cls}"><b>${verdictLabel(res)}</b></td>
+      <td>${causeLabel(res.cause) || "—"}</td>
+      <td><small>${res.valid ? "采用 " + (res.selectedPath || []).join(" → ") : (res.reason || "")}</small></td>
+      <td>${diff}</td>
+      <td>证据 #${res.evidenceId}</td>
+    </tr>`;
+  }).join("");
+  target.innerHTML = `
+    <div class="muted">同一事件时刻 ${fmtDate(rows[0].eventTime)} 在 ${rows.length} 个获知截止下的对照（证书 ${rows[0].leafId} · 用途 ${rows[0].purpose}）：</div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>获知截止</th><th>结论</th><th>决定因素</th><th>依据</th><th>与前一截止的差异</th><th>证据</th></tr></thead>
+      <tbody>${body}</tbody>
+    </table></div>`;
 }
 
 bindForms();

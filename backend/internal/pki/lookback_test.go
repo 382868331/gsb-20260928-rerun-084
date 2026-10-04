@@ -122,9 +122,11 @@ func TestCorrectedRevocationDate(t *testing.T) {
 	}
 }
 
-// Trust decisions are evaluated as known at the cutoff: a path valid while
-// the root was trusted becomes disqualified once the distrust is learned,
-// with a distinct reason from missing evidence.
+// Trust decisions take effect at their effective time, not their learned
+// time: a root trusted when the event happened but distrusted afterwards
+// still anchors that event, even when the investigation's knowledge
+// cutoff already includes the distrust decision. A distrust effective
+// before the event disqualifies it with a trust cause.
 func TestTrustEvaluatedAtKnowledgeCutoff(t *testing.T) {
 	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	l, cur := clockLab(t, t0)
@@ -145,15 +147,35 @@ func TestTrustEvaluatedAtKnowledgeCutoff(t *testing.T) {
 		t.Fatalf("cutoff before distrust must still validate: %s", whileTrusted.Reason)
 	}
 
+	// The distrust took effect at t4, after the event: the event must not
+	// be retroactively condemned by the later trust state. (The verdict
+	// here is undetermined only because the CRL known at the late cutoff
+	// does not reach back to the event — a missing-evidence cause, not a
+	// trust cause.)
 	afterDistrust, err := l.VerifyAt("leaf1", EKUServer, nil, event, t4.Add(time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if afterDistrust.Valid || afterDistrust.Status != StatusDisqualified {
-		t.Fatalf("expected disqualified after distrust, got %v %q", afterDistrust.Valid, afterDistrust.Status)
+	if afterDistrust.Status == StatusDisqualified || afterDistrust.Cause == CauseTrust {
+		t.Fatalf("later distrust must not condemn an earlier event, got %v %q cause=%q",
+			afterDistrust.Status, afterDistrust.Reason, afterDistrust.Cause)
 	}
-	if !strings.Contains(afterDistrust.Reason, "not a trusted anchor as of the knowledge cutoff") {
-		t.Fatalf("expected cutoff trust reason, got %q", afterDistrust.Reason)
+	if strings.Contains(afterDistrust.Reason, "trusted anchor") {
+		t.Fatalf("event predating the distrust must not fail on trust, got %q", afterDistrust.Reason)
+	}
+
+	// A distrust effective before the event does disqualify it, with a
+	// trust cause distinct from missing evidence.
+	if err := l.ScheduleTrust("r1", false, t0.Add(30*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	distrusted, err := l.VerifyAt("leaf1", EKUServer, nil, event, t4.Add(2*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if distrusted.Valid || distrusted.Status != StatusDisqualified || distrusted.Cause != CauseTrust {
+		t.Fatalf("distrust effective before the event must disqualify with trust cause, got %v %q cause=%q",
+			distrusted.Valid, distrusted.Reason, distrusted.Cause)
 	}
 }
 

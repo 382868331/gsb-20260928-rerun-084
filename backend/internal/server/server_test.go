@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -215,5 +216,130 @@ func TestDualLookbackOverHTTP(t *testing.T) {
 	}
 	if hist[2]["valid"] != true {
 		t.Fatal("oldest evidence must still show its original conclusion")
+	}
+}
+
+// The three follow-up experiments through the real HTTP surface:
+// future-effective trust changes, late-arriving revocation material and
+// corrected material, each producing frozen reports and new comparison
+// versions.
+func TestFollowupExperimentsOverHTTP(t *testing.T) {
+	_, h := newHarness(t)
+	now := time.Now().UTC()
+
+	// 1. Trust change learned now but effective in the future: an event
+	// before the effective time keeps the old trust status; an event
+	// after it fails with a trust cause.
+	effective := now.Add(time.Hour)
+	for _, root := range []string{"rootA", "rootB"} {
+		code, resp := do(t, h, "POST", "/api/certs/"+root+"/trust",
+			`{"trusted":false,"effectiveAt":"`+effective.Format(time.RFC3339)+`"}`)
+		if code != http.StatusOK {
+			t.Fatalf("schedule trust: %d %v", code, resp)
+		}
+	}
+	// The current trust set is unchanged until the effective time.
+	_, state := do(t, h, "GET", "/api/state", "")
+	if roots := state["trustedRoots"].([]any); len(roots) == 0 {
+		t.Fatal("future-effective change must not alter the current trust set")
+	}
+	before := now.Add(30 * time.Minute)
+	code, res := do(t, h, "POST", "/api/verify", `{"leafId":"leaf-ok","purpose":"serverAuth",`+
+		`"eventTime":"`+before.Format(time.RFC3339)+`","knowledgeCutoff":"`+before.Add(time.Minute).Format(time.RFC3339)+`"}`)
+	if code != http.StatusOK || res["valid"] != true {
+		t.Fatalf("event before the effective time must still validate: %d %v", code, res["reason"])
+	}
+	after := effective.Add(30 * time.Minute)
+	code, res = do(t, h, "POST", "/api/verify", `{"leafId":"leaf-ok","purpose":"serverAuth",`+
+		`"eventTime":"`+after.Format(time.RFC3339)+`","knowledgeCutoff":"`+after.Add(time.Minute).Format(time.RFC3339)+`"}`)
+	if code != http.StatusOK || res["valid"] != false || res["cause"] != "trust" {
+		t.Fatalf("event after the effective time must fail on trust: %d %v cause=%v", code, res["reason"], res["cause"])
+	}
+
+	// 2. Late-arriving revocation material: learned now, effective in the
+	// past. The same event is valid under the old knowledge cutoff and
+	// revoked under the new one; the difference is attributed to
+	// revocation taking effect.
+	_, h2 := newHarness(t)
+	now2 := time.Now().UTC()
+	event := now2
+	cutoffOld := time.Now().UTC()
+	code, _ = do(t, h2, "POST", "/api/certs/leaf-ok/revoke",
+		`{"revokedAt":"`+now2.Add(-time.Hour).Format(time.RFC3339)+`"}`)
+	if code != http.StatusOK {
+		t.Fatalf("late revoke: %d", code)
+	}
+	code, oldRes := do(t, h2, "POST", "/api/verify", `{"leafId":"leaf-ok","purpose":"serverAuth",`+
+		`"eventTime":"`+event.Format(time.RFC3339Nano)+`","knowledgeCutoff":"`+cutoffOld.Format(time.RFC3339Nano)+`"}`)
+	if code != http.StatusOK || oldRes["valid"] != true {
+		t.Fatalf("old cutoff must not see the late material: %d %v", code, oldRes)
+	}
+	code, newRes := do(t, h2, "POST", "/api/verify", `{"leafId":"leaf-ok","purpose":"serverAuth",`+
+		`"eventTime":"`+event.Format(time.RFC3339Nano)+`"}`)
+	if code != http.StatusOK || newRes["valid"] != false || newRes["cause"] != "revocation" {
+		t.Fatalf("late material must disqualify with revocation cause: %d %v cause=%v", code, newRes["reason"], newRes["cause"])
+	}
+
+	// 3. Corrected material: the correction only affects investigations
+	// whose cutoff includes it; the saved earlier report is frozen.
+	past := now2.Add(-2 * time.Hour).Format(time.RFC3339)
+	code, _ = do(t, h2, "POST", "/api/certs/leaf-ok/correctrevoke", `{"revokedAt":"`+past+`"}`)
+	if code != http.StatusOK {
+		t.Fatalf("correctrevoke: %d", code)
+	}
+	code, oldAgain := do(t, h2, "POST", "/api/verify", `{"leafId":"leaf-ok","purpose":"serverAuth",`+
+		`"eventTime":"`+event.Format(time.RFC3339Nano)+`","knowledgeCutoff":"`+cutoffOld.Format(time.RFC3339Nano)+`"}`)
+	if code != http.StatusOK || oldAgain["valid"] != true {
+		t.Fatalf("correction must not leak into an old-cutoff review: %d %v", code, oldAgain["reason"])
+	}
+	req := httptest.NewRequest("GET", "/api/history", nil)
+	rec := httptest.NewRecorder()
+	h2.ServeHTTP(rec, req)
+	var hist []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &hist); err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range hist {
+		if e["evidenceId"] == oldRes["evidenceId"] && e["valid"] != true {
+			t.Fatal("the frozen report must keep its original conclusion")
+		}
+	}
+}
+
+// A saved lab reopens with the same reports and material versions, and
+// the server keeps serving them.
+func TestPersistReloadOverHTTP(t *testing.T) {
+	path := t.TempDir() + "/state.json"
+	lab := pki.NewLab()
+	if err := pki.LoadSamples(lab); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{lab: lab, hmux: http.NewServeMux(), persistPath: path}
+	s.routes()
+	if res := doVerify(t, s.hmux, "leaf-ok"); res["valid"] != true {
+		t.Fatalf("baseline: %v", res["reason"])
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("state file must be written after a verification: %v", err)
+	}
+
+	back, err := pki.LoadLab(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2 := &Server{lab: back, hmux: http.NewServeMux(), persistPath: path}
+	s2.routes()
+	req := httptest.NewRequest("GET", "/api/history", nil)
+	rec := httptest.NewRecorder()
+	s2.hmux.ServeHTTP(rec, req)
+	var hist []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &hist); err != nil {
+		t.Fatal(err)
+	}
+	if len(hist) != 1 || hist[0]["valid"] != true || hist[0]["evidenceId"] != float64(1) {
+		t.Fatalf("reopened lab must serve the frozen report, got %v", hist)
+	}
+	if res := doVerify(t, s2.hmux, "leaf-ok"); res["valid"] != true {
+		t.Fatalf("reopened lab must keep verifying: %v", res["reason"])
 	}
 }

@@ -3,6 +3,7 @@ package pki
 import (
 	"crypto/x509"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
@@ -19,6 +20,23 @@ const (
 	// StatusUndetermined: not provably bad, but evidence is missing (no
 	// CRL published, or revocation data not yet valid / stale).
 	StatusUndetermined ChainStatus = "undetermined"
+)
+
+// Cause identifies which kind of material decided a path's verdict, so a
+// comparison across knowledge cutoffs can say whether a changed
+// conclusion came from trust taking effect, revocation taking effect or
+// missing evidence.
+type Cause string
+
+const (
+	CauseNone       Cause = ""
+	CauseTrust      Cause = "trust"            // trust decision effective at the event time
+	CauseRevocation Cause = "revocation"       // revocation effective at the event time
+	CauseEvidence   Cause = "missing-evidence" // revocation data missing / not covering the event
+	CauseExpiry     Cause = "expiry"           // validity period at the event time
+	CausePurpose    Cause = "purpose"          // ExtKeyUsage mismatch
+	CauseSignature  Cause = "signature"        // cryptographic chain failure
+	CausePolicy     Cause = "policy"           // experiment policy (allowed roots / require CRL)
 )
 
 // Policy captures the per-experiment selection preferences and mandatory
@@ -89,6 +107,9 @@ type ChainReport struct {
 	Valid  bool        `json:"valid"`
 	Status ChainStatus `json:"status"`
 	Reason string      `json:"reason,omitempty"`
+	// Cause classifies the material that decided this path's verdict
+	// (trust / revocation / missing evidence / ...). Empty when valid.
+	Cause Cause `json:"cause,omitempty"`
 	// Evidence lists every material this path's verdict actually relied
 	// on, with the time the material became effective and the time the
 	// lab learned it. Exporting a report therefore shows exactly which
@@ -126,13 +147,17 @@ type VerifyResult struct {
 	// only certificates, revocation claims, trust decisions and CRLs
 	// learned on or before this moment count. Materials that arrived
 	// later never overwrite a saved investigation's basis.
-	KnowledgeCutoff time.Time     `json:"knowledgeCutoff"`
-	Valid           bool          `json:"valid"`
-	Status          ChainStatus   `json:"status"`
-	Reason          string        `json:"reason,omitempty"`
-	SelectedPath    []string      `json:"selectedPath,omitempty"`
-	Chains          []ChainReport `json:"chains"`
-	TrustedRoots    []string      `json:"trustedRoots"`
+	KnowledgeCutoff time.Time   `json:"knowledgeCutoff"`
+	Valid           bool        `json:"valid"`
+	Status          ChainStatus `json:"status"`
+	Reason          string      `json:"reason,omitempty"`
+	// Cause classifies what decided the overall conclusion, so a
+	// comparison across knowledge cutoffs can attribute a changed
+	// verdict to trust, revocation or missing evidence.
+	Cause        Cause         `json:"cause,omitempty"`
+	SelectedPath []string      `json:"selectedPath,omitempty"`
+	Chains       []ChainReport `json:"chains"`
+	TrustedRoots []string      `json:"trustedRoots"`
 }
 
 // Verify performs a live verification of leafID for the requested purpose
@@ -196,11 +221,16 @@ func (l *Lab) VerifyAt(leafID string, purpose EKU, policy *Policy, eventTime, kn
 		CheckedAt: now.UTC(), Policy: pol,
 		EventTime: eventTime.UTC(), KnowledgeCutoff: knowledgeCutoff.UTC(),
 	}
-	for id := range l.trust {
-		if l.trust[id] {
+	rootIDs := map[string]bool{}
+	for _, ev := range l.trustLog {
+		rootIDs[ev.RootID] = true
+	}
+	for id := range rootIDs {
+		if trusted, _, _, known := l.trustedAtLocked(id, eventTime, knowledgeCutoff); known && trusted {
 			res.TrustedRoots = append(res.TrustedRoots, id)
 		}
 	}
+	sort.Strings(res.TrustedRoots)
 
 	// Enumerate every cryptographic path from the leaf to a self-signed root.
 	// Only certificates obtained on or before the knowledge cutoff may
@@ -222,15 +252,16 @@ func (l *Lab) VerifyAt(leafID string, purpose EKU, policy *Policy, eventTime, kn
 				Revoked: c.Revoked, CRLPublished: c.CRLPublished,
 			}
 			if c.Kind == KindRoot {
-				trusted, _, known := l.trustedAtLocked(c.ID, knowledgeCutoff)
+				trusted, _, _, known := l.trustedAtLocked(c.ID, eventTime, knowledgeCutoff)
 				step.Trusted = known && trusted
 			}
 			report.Path = append(report.Path, step)
 		}
 
-		if status, reason := l.evaluateChain(chain, wantEKU, eventTime, knowledgeCutoff, pol, &report); status != StatusValid {
+		if status, reason, cause := l.evaluateChain(chain, wantEKU, eventTime, knowledgeCutoff, pol, &report); status != StatusValid {
 			report.Status = status
 			report.Reason = reason
+			report.Cause = cause
 		}
 		report.Valid = report.Status == StatusValid
 		res.Chains = append(res.Chains, report)
@@ -264,6 +295,12 @@ func (l *Lab) VerifyAt(leafID string, purpose EKU, policy *Policy, eventTime, kn
 			res.Status = StatusDisqualified
 		}
 		res.Reason = summarize(res.Chains)
+		for _, ch := range res.Chains {
+			if ch.Status == res.Status {
+				res.Cause = ch.Cause
+				break
+			}
+		}
 	}
 	l.history = append(l.history, res)
 	res.EvidenceID = len(l.history)
@@ -301,7 +338,7 @@ func summarize(reports []ChainReport) string {
 // failures (expiry, revocation, purpose, anchor, signatures, CRL hits) are
 // disqualified; missing or not-yet-effective revocation data only makes the
 // path undetermined unless the experiment policy requires complete CRLs.
-func (l *Lab) evaluateChain(chain []*Cert, wantEKU x509.ExtKeyUsage, eventTime, cutoff time.Time, pol *Policy, report *ChainReport) (ChainStatus, string) {
+func (l *Lab) evaluateChain(chain []*Cert, wantEKU x509.ExtKeyUsage, eventTime, cutoff time.Time, pol *Policy, report *ChainReport) (ChainStatus, string, Cause) {
 	leaf := chain[0]
 
 	// Record every certificate material this path relies on.
@@ -321,7 +358,7 @@ func (l *Lab) evaluateChain(chain []*Cert, wantEKU x509.ExtKeyUsage, eventTime, 
 		}
 	}
 	if !hasPurpose {
-		return StatusDisqualified, "purpose not permitted by certificate ExtKeyUsage"
+		return StatusDisqualified, "purpose not permitted by certificate ExtKeyUsage", CausePurpose
 	}
 
 	// Validity period (at the event time), revocation state (as known at
@@ -330,50 +367,61 @@ func (l *Lab) evaluateChain(chain []*Cert, wantEKU x509.ExtKeyUsage, eventTime, 
 	// instead of hiding it behind a generic stdlib verify error.
 	for _, c := range chain {
 		if eventTime.Before(c.Cert.NotBefore) {
-			return StatusDisqualified, fmt.Sprintf("certificate %q not yet valid at the event time", c.Label)
+			return StatusDisqualified, fmt.Sprintf("certificate %q not yet valid at the event time", c.Label), CauseExpiry
 		}
 		if eventTime.After(c.Cert.NotAfter) {
-			return StatusDisqualified, fmt.Sprintf("certificate %q expired at the event time", c.Label)
+			return StatusDisqualified, fmt.Sprintf("certificate %q expired at the event time", c.Label), CauseExpiry
 		}
 		if rec, known := revocationAtLocked(c, cutoff); known {
 			rev, learned := rec.RevokedAt, rec.LearnedAt
+			detail := rec.Note
+			if rec.Retracted {
+				detail = "撤销材料已撤回（获知 " + learned.Format(time.RFC3339) + "）"
+			}
+			if conflict := revocationConflictLocked(c, cutoff); conflict != "" {
+				detail = strings.TrimSuffix(detail+"；", "；") + "；" + conflict
+			}
 			report.Evidence = append(report.Evidence, MaterialRef{
 				Type: "revocation", ID: c.ID, Label: c.Label,
-				EffectiveAt: &rev, LearnedAt: &learned, Detail: rec.Note,
+				EffectiveAt: &rev, LearnedAt: &learned, Detail: detail,
 			})
-			if !rec.RevokedAt.After(eventTime) {
+			if !rec.Retracted && !rec.RevokedAt.After(eventTime) {
 				return StatusDisqualified, fmt.Sprintf(
 					"certificate %q revoked with effect %s (learned %s)",
-					c.Label, rec.RevokedAt.Format(time.RFC3339), rec.LearnedAt.Format(time.RFC3339))
+					c.Label, rec.RevokedAt.Format(time.RFC3339), rec.LearnedAt.Format(time.RFC3339)), CauseRevocation
 			}
 		}
 		if c != leaf && !c.Cert.IsCA {
-			return StatusDisqualified, fmt.Sprintf("certificate %q is not a CA", c.Label)
+			return StatusDisqualified, fmt.Sprintf("certificate %q is not a CA", c.Label), CauseSignature
 		}
 	}
 
 	root := chain[len(chain)-1]
 	if root.Kind != KindRoot || root.Cert.Subject.String() != root.Cert.Issuer.String() {
-		return StatusDisqualified, "chain does not end at a self-signed root"
+		return StatusDisqualified, "chain does not end at a self-signed root", CauseSignature
 	}
-	trusted, trustAt, trustKnown := l.trustedAtLocked(root.ID, cutoff)
+	trusted, trustEffective, trustLearned, trustKnown := l.trustedAtLocked(root.ID, eventTime, cutoff)
 	if trustKnown {
+		detail := map[bool]string{true: "受信任", false: "停止受信"}[trusted]
+		if conflict := l.trustConflictLocked(root.ID, eventTime, cutoff); conflict != "" {
+			detail += "；" + conflict
+		}
 		report.Evidence = append(report.Evidence, MaterialRef{
 			Type: "trust", ID: root.ID, Label: root.Label,
-			EffectiveAt: &trustAt, LearnedAt: &trustAt,
-			Detail: map[bool]string{true: "受信任", false: "停止受信"}[trusted],
+			EffectiveAt: &trustEffective, LearnedAt: &trustLearned,
+			Detail: detail,
 		})
 	}
 	if !trustKnown {
 		return StatusUndetermined, fmt.Sprintf(
-			"no trust decision for root %q known at the knowledge cutoff", root.Label)
+			"no trust decision for root %q known at the knowledge cutoff", root.Label), CauseTrust
 	}
 	if !trusted {
 		return StatusDisqualified, fmt.Sprintf(
-			"root %q was not a trusted anchor as of the knowledge cutoff", root.Label)
+			"root %q was not a trusted anchor in effect at the event time (as known at the knowledge cutoff)", root.Label), CauseTrust
 	}
 	if !pol.rootAllowed(root.ID) {
-		return StatusDisqualified, fmt.Sprintf("root %q is outside this experiment's allowed roots", root.Label)
+		return StatusDisqualified, fmt.Sprintf("root %q is outside this experiment's allowed roots", root.Label), CausePolicy
 	}
 
 	// Cryptographic confirmation of the whole path via the standard library.
@@ -391,7 +439,7 @@ func (l *Lab) evaluateChain(chain []*Cert, wantEKU x509.ExtKeyUsage, eventTime, 
 		CurrentTime:   eventTime,
 		KeyUsages:     []x509.ExtKeyUsage{wantEKU},
 	}); err != nil {
-		return StatusDisqualified, "chain verification failed: " + err.Error()
+		return StatusDisqualified, "chain verification failed: " + err.Error(), CauseSignature
 	}
 
 	// Revocation data for every issuing CA, reconstructed as knowable at
@@ -418,10 +466,10 @@ func (l *Lab) evaluateChain(chain []*Cert, wantEKU x509.ExtKeyUsage, eventTime, 
 		}
 		crl, err := x509.ParseRevocationList(der)
 		if err != nil {
-			return StatusDisqualified, "invalid CRL from " + issuerNode.Label
+			return StatusDisqualified, "invalid CRL from " + issuerNode.Label, CauseSignature
 		}
 		if err := crl.CheckSignatureFrom(ca.Cert); err != nil {
-			return StatusDisqualified, "CRL signature invalid for " + issuerNode.Label
+			return StatusDisqualified, "CRL signature invalid for " + issuerNode.Label, CauseSignature
 		}
 		knownAt := ca.CRLKnownAt
 		thisUpdate := crl.ThisUpdate
@@ -445,19 +493,19 @@ func (l *Lab) evaluateChain(chain []*Cert, wantEKU x509.ExtKeyUsage, eventTime, 
 				if c.Cert.SerialNumber.Cmp(entry.SerialNumber) == 0 && !entry.RevocationTime.After(eventTime) {
 					return StatusDisqualified, fmt.Sprintf(
 						"certificate %q listed on CRL of %q with effect %s",
-						c.Label, ca.Label, entry.RevocationTime.Format(time.RFC3339))
+						c.Label, ca.Label, entry.RevocationTime.Format(time.RFC3339)), CauseRevocation
 				}
 			}
 		}
 	}
-	return StatusValid, ""
+	return StatusValid, "", CauseNone
 }
 
-func missingCRLVerdict(pol *Policy, reason string) (ChainStatus, string) {
+func missingCRLVerdict(pol *Policy, reason string) (ChainStatus, string, Cause) {
 	if pol.RequireCRL {
-		return StatusDisqualified, reason + " (policy requires complete revocation data)"
+		return StatusDisqualified, reason + " (policy requires complete revocation data)", CausePolicy
 	}
-	return StatusUndetermined, reason
+	return StatusUndetermined, reason, CauseEvidence
 }
 
 // enumerate DFS-walks all parents that cryptographically signed the current

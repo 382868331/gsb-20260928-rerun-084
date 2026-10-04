@@ -64,7 +64,7 @@
 
     <section class="panel">
       <h2>信任与撤销资料</h2>
-      <p class="hint">信任开关只对根证书生效；“发布 CRL” 关闭表示该 CA 撤销资料缺失。</p>
+      <p class="hint">信任开关只对根证书生效，可预约未来生效的信任变化；撤销可指定过去的生效时间（晚到材料），也可撤回。每条信任决定与撤销记录都区分“生效时间”和“获知时间”。</p>
       <div class="table-wrap">
         <table>
           <thead>
@@ -73,6 +73,10 @@
           <tbody id="certRows"></tbody>
         </table>
       </div>
+      <details class="trustlog">
+        <summary>信任决定日志（生效时间 / 获知时间）</summary>
+        <ul id="trustLog"></ul>
+      </details>
     </section>
 
     <section class="panel">
@@ -94,6 +98,23 @@
         <span class="hint">事件时刻=要研究的过去时刻；获知截止=只使用此前已取得的材料。留空均为现在。以上偏好仅作用于下一次验证，并随证据保存，便于比较选择变化。</span>
       </form>
       <div id="verifyResult" class="result"></div>
+    </section>
+
+    <section class="panel">
+      <h2>多获知截止对照</h2>
+      <p class="hint">对同一事件时刻，用多个获知截止分别复查（每次复查生成一条新证据，旧证据不变）。
+        对照表标出相邻两次复查的结论差异来自信任生效、撤销生效还是证据缺失。</p>
+      <form id="compareForm" class="inline">
+        <select name="leafId" id="compareLeaf" required></select>
+        <select name="purpose">
+          <option value="serverAuth">serverAuth</option>
+          <option value="clientAuth">clientAuth</option>
+        </select>
+        <label class="check">事件时刻 <input type="datetime-local" name="eventTime" step="60" required /></label>
+        <input name="cutoffs" placeholder="获知截止，逗号分隔（留空=取该证书历史证据的截止）" size="46" />
+        <button>生成对照报告</button>
+      </form>
+      <div id="compareResult" class="result"></div>
     </section>
 
     <section class="panel">

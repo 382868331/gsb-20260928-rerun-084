@@ -111,3 +111,8 @@ th { color: var(--muted); font-weight: 500; font-size: 12px; }
 .materials { margin-top: 4px; font-size: 12px; }
 .materials ul { margin: 4px 0 0 16px; padding: 0; }
 .materials li { margin: 2px 0; }
+
+.trustlog { margin-top: 10px; font-size: 13px; }
+.trustlog summary { cursor: pointer; color: var(--muted); }
+.trustlog ul { margin: 6px 0 0; padding-left: 18px; }
+.trustlog li { margin: 2px 0; color: var(--muted); }

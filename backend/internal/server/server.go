@@ -16,18 +16,39 @@ import (
 var webFS embed.FS
 
 type Server struct {
-	lab  *pki.Lab
-	hmux *http.ServeMux
+	lab         *pki.Lab
+	hmux        *http.ServeMux
+	persistPath string
 }
 
-func New(lab *pki.Lab) *http.Server {
+// New builds the HTTP server. When persistPath is non-empty every state
+// change (including each appended verification report) is saved there, so
+// reopening the lab restores the exact reports and material versions.
+func New(lab *pki.Lab, persistPath ...string) *http.Server {
 	s := &Server{lab: lab, hmux: http.NewServeMux()}
+	if len(persistPath) > 0 {
+		s.persistPath = persistPath[0]
+	}
 	s.routes()
 	return &http.Server{
 		Addr:              ":8080",
 		Handler:           logging(s.hmux),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
+}
+
+// persist saves the lab snapshot after a successful mutation. A save
+// failure is reported to the caller: a report that cannot be frozen must
+// not silently exist only in memory.
+func (s *Server) persist(w http.ResponseWriter) bool {
+	if s.persistPath == "" {
+		return true
+	}
+	if err := s.lab.Save(s.persistPath); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "persist state: " + err.Error()})
+		return false
+	}
+	return true
 }
 
 func (s *Server) routes() {
@@ -100,6 +121,9 @@ func (s *Server) handleAddRoot(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	if !s.persist(w) {
+		return
+	}
 	writeJSON(w, http.StatusCreated, c.View())
 }
 
@@ -119,6 +143,9 @@ func (s *Server) handleAddIntermediate(w http.ResponseWriter, r *http.Request) {
 	c, err := s.lab.AddIntermediate(req.ID, req.CN, req.IssuerID, req.CrossSubjectID, req.Years)
 	if err != nil {
 		writeErr(w, err)
+		return
+	}
+	if !s.persist(w) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, c.View())
@@ -162,6 +189,9 @@ func (s *Server) handleAddLeaf(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	if !s.persist(w) {
+		return
+	}
 	writeJSON(w, http.StatusCreated, c.View())
 }
 
@@ -183,6 +213,9 @@ func (s *Server) handleRotate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	if !s.persist(w) {
+		return
+	}
 	writeJSON(w, http.StatusCreated, c.View())
 }
 
@@ -194,7 +227,27 @@ func (s *Server) handleCertAction(w http.ResponseWriter, r *http.Request) {
 	}
 	switch action {
 	case "revoke":
-		if err := s.lab.Revoke(id); err != nil {
+		var body struct{ RevokedAt string }
+		if r.ContentLength != 0 && !decode(w, r, &body) {
+			return
+		}
+		at, err := parseTimeOpt(body.RevokedAt)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		// RevokedAt may be a past moment: the claim is learned now but
+		// effective then, modelling late-arriving revocation material.
+		if err := s.lab.RevokeAt(id, at); err != nil {
+			writeErr(w, err)
+			return
+		}
+	case "retractrevoke":
+		var body struct{ Note string }
+		if r.ContentLength != 0 && !decode(w, r, &body) {
+			return
+		}
+		if err := s.lab.RetractRevocation(id, body.Note); err != nil {
 			writeErr(w, err)
 			return
 		}
@@ -213,11 +266,21 @@ func (s *Server) handleCertAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	case "trust":
-		var body struct{ Trusted bool }
+		var body struct {
+			Trusted     bool
+			EffectiveAt string
+		}
 		if r.ContentLength != 0 && !decode(w, r, &body) {
 			return
 		}
-		if err := s.lab.SetTrust(id, body.Trusted); err != nil {
+		at, err := parseTimeOpt(body.EffectiveAt)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		// EffectiveAt may lie in the future: the decision is learned now
+		// but only applies to events at or after that moment.
+		if err := s.lab.ScheduleTrust(id, body.Trusted, at); err != nil {
 			writeErr(w, err)
 			return
 		}
@@ -241,6 +304,9 @@ func (s *Server) handleCertAction(w http.ResponseWriter, r *http.Request) {
 		}
 	default:
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unknown action"})
+		return
+	}
+	if !s.persist(w) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -301,6 +367,9 @@ func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	if !s.persist(w) {
+		return
+	}
 	writeJSON(w, http.StatusOK, res)
 }
 
@@ -313,11 +382,17 @@ func (s *Server) handleSamples(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	if !s.persist(w) {
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "loaded"})
 }
 
 func (s *Server) handleReset(w http.ResponseWriter, r *http.Request) {
 	s.lab.Reset()
+	if !s.persist(w) {
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "reset"})
 }
 
