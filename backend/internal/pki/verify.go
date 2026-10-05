@@ -258,7 +258,8 @@ func (l *Lab) VerifyAt(leafID string, purpose EKU, policy *Policy, eventTime, kn
 			report.Path = append(report.Path, step)
 		}
 
-		if status, reason, cause := l.evaluateChain(chain, wantEKU, eventTime, knowledgeCutoff, pol, &report); status != StatusValid {
+		live := !knowledgeCutoff.Before(now)
+		if status, reason, cause := l.evaluateChain(chain, wantEKU, eventTime, knowledgeCutoff, live, pol, &report); status != StatusValid {
 			report.Status = status
 			report.Reason = reason
 			report.Cause = cause
@@ -338,7 +339,7 @@ func summarize(reports []ChainReport) string {
 // failures (expiry, revocation, purpose, anchor, signatures, CRL hits) are
 // disqualified; missing or not-yet-effective revocation data only makes the
 // path undetermined unless the experiment policy requires complete CRLs.
-func (l *Lab) evaluateChain(chain []*Cert, wantEKU x509.ExtKeyUsage, eventTime, cutoff time.Time, pol *Policy, report *ChainReport) (ChainStatus, string, Cause) {
+func (l *Lab) evaluateChain(chain []*Cert, wantEKU x509.ExtKeyUsage, eventTime, cutoff time.Time, live bool, pol *Policy, report *ChainReport) (ChainStatus, string, Cause) {
 	leaf := chain[0]
 
 	// Record every certificate material this path relies on.
@@ -443,24 +444,52 @@ func (l *Lab) evaluateChain(chain []*Cert, wantEKU x509.ExtKeyUsage, eventTime, 
 	}
 
 	// Revocation data for every issuing CA, reconstructed as knowable at
-	// the knowledge cutoff. Missing, not-yet-obtained, not-yet-effective
-	// or stale revocation data makes the path undetermined (or
-	// disqualified when the policy mandates complete CRLs); a CRL that
-	// lists a path certificate with effect at or before the event time is
-	// a definitive disqualification. Each CA's CRL is consulted under
-	// that CA's own logical node, so a cross certificate's missing
-	// publication flag cannot mask the original CA's CRL.
+	// the knowledge cutoff. A live investigation fetches a fresh CRL from
+	// each CA; a historical investigation selects the frozen issuance
+	// learned by the cutoff whose coverage interval contains the event
+	// time, so the material's effective/learned times never shift with
+	// the query cutoff. Missing, not-yet-obtained, not-yet-effective or
+	// stale revocation data makes the path undetermined (or disqualified
+	// when the policy mandates complete CRLs); a CRL that lists a path
+	// certificate with effect at or before the event time is a definitive
+	// disqualification. Each CA's CRL is consulted under that CA's own
+	// logical node, so a cross certificate's missing publication flag
+	// cannot mask the original CA's CRL.
 	for _, issuerNode := range chain[1:] {
 		ca := l.canonicalIssuerLocked(issuerNode)
 		if !issuerNode.CRLPublished || !ca.CRLPublished {
 			return missingCRLVerdict(pol, fmt.Sprintf("revocation data missing for CA %q", issuerNode.Label))
 		}
-		if ca.CRLKnownAt.After(cutoff) {
+		var iss CRLIssue
+		known := false
+		if live {
+			// Fetching the current CRL is itself an issuance the lab
+			// learns now; record it so later historical reviews can cite
+			// this exact coverage interval.
+			iss, known = l.issueCRLLocked(ca, cutoff), true
+		} else if covering, ok := crlIssueCoveringLocked(ca, eventTime, cutoff); ok {
+			iss, known = covering, true
+		} else {
+			// No known issuance covers the event time; fall back to the
+			// latest known one so the report can show its actual
+			// interval when explaining the missing coverage.
+			iss, known = crlIssueLatestLocked(ca, cutoff)
+		}
+		if !known {
+			if len(ca.CRLIssues) == 0 {
+				return missingCRLVerdict(pol, fmt.Sprintf("revocation data missing for CA %q", issuerNode.Label))
+			}
+			earliest := ca.CRLIssues[0].LearnedAt
+			for _, it := range ca.CRLIssues {
+				if it.LearnedAt.Before(earliest) {
+					earliest = it.LearnedAt
+				}
+			}
 			return missingCRLVerdict(pol, fmt.Sprintf(
 				"revocation data for CA %q only obtained at %s, after the knowledge cutoff",
-				issuerNode.Label, ca.CRLKnownAt.Format(time.RFC3339)))
+				issuerNode.Label, earliest.Format(time.RFC3339)))
 		}
-		der, err := l.buildCRLAtLocked(ca, cutoff, cutoff)
+		der, err := l.buildCRLAtLocked(ca, iss, cutoff)
 		if err != nil {
 			return missingCRLVerdict(pol, "CRL unavailable for "+issuerNode.Label+": "+err.Error())
 		}
@@ -471,11 +500,11 @@ func (l *Lab) evaluateChain(chain []*Cert, wantEKU x509.ExtKeyUsage, eventTime, 
 		if err := crl.CheckSignatureFrom(ca.Cert); err != nil {
 			return StatusDisqualified, "CRL signature invalid for " + issuerNode.Label, CauseSignature
 		}
-		knownAt := ca.CRLKnownAt
+		learnedAt := iss.LearnedAt
 		thisUpdate := crl.ThisUpdate
 		report.Evidence = append(report.Evidence, MaterialRef{
 			Type: "crl", ID: ca.ID, Label: ca.Label,
-			EffectiveAt: &thisUpdate, LearnedAt: &knownAt,
+			EffectiveAt: &thisUpdate, LearnedAt: &learnedAt,
 			Detail: "覆盖 " + crl.ThisUpdate.Format(time.RFC3339) + " → " + crl.NextUpdate.Format(time.RFC3339),
 		})
 		if eventTime.Before(crl.ThisUpdate) {

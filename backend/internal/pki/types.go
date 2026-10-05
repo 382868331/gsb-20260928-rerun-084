@@ -51,6 +51,12 @@ type Cert struct {
 	// revocation material that is published but not yet effective
 	// ("late" revocation data).
 	CRLDelayMin int
+	// CRLIssues is the append-only log of CRL issuances by this CA. Each
+	// record freezes the coverage interval (ThisUpdate/NextUpdate) and the
+	// moment the lab obtained it; historical investigations pick the
+	// issuance covering the event time instead of re-dating a CRL against
+	// the query cutoff.
+	CRLIssues []CRLIssue
 	// LearnedAt is when this certificate material was obtained by the
 	// lab. Chain building for a historical investigation only uses
 	// certificates learned on or before the knowledge cutoff.
@@ -60,6 +66,16 @@ type Cert struct {
 	// the moment the lab learned it; corrections add a new record with a
 	// later LearnedAt instead of rewriting the old one.
 	Revocations []RevocationRecord
+}
+
+// CRLIssue is one learned issuance of a CA's revocation list. ThisUpdate
+// and NextUpdate are the coverage interval frozen at issuance; LearnedAt
+// is when the lab obtained it. Querying with a different knowledge cutoff
+// never rewrites these times.
+type CRLIssue struct {
+	ThisUpdate time.Time `json:"thisUpdate"`
+	NextUpdate time.Time `json:"nextUpdate"`
+	LearnedAt  time.Time `json:"learnedAt"`
 }
 
 // RevocationRecord is one learned claim that a certificate was revoked.
@@ -114,6 +130,7 @@ type PublicView struct {
 	CRLPublished bool               `json:"crlPublished"`
 	CRLKnownAt   *time.Time         `json:"crlKnownAt,omitempty"`
 	CRLDelayMin  int                `json:"crlDelayMin,omitempty"`
+	CRLIssues    []CRLIssue         `json:"crlIssues,omitempty"`
 	LearnedAt    time.Time          `json:"learnedAt"`
 	PEM          string             `json:"pem"`
 }
@@ -160,6 +177,7 @@ func (c *Cert) View() PublicView {
 		v.CRLKnownAt = &t
 	}
 	v.CRLDelayMin = c.CRLDelayMin
+	v.CRLIssues = append(v.CRLIssues, c.CRLIssues...)
 	v.LearnedAt = c.LearnedAt
 	return v
 }

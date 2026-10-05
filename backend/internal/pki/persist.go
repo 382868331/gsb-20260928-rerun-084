@@ -39,6 +39,7 @@ type certState struct {
 	CRLPublished bool               `json:"crlPublished"`
 	CRLKnownAt   time.Time          `json:"crlKnownAt,omitempty"`
 	CRLDelayMin  int                `json:"crlDelayMin,omitempty"`
+	CRLIssues    []CRLIssue         `json:"crlIssues,omitempty"`
 	LearnedAt    time.Time          `json:"learnedAt"`
 	Revocations  []RevocationRecord `json:"revocations,omitempty"`
 }
@@ -60,6 +61,7 @@ func (l *Lab) Save(path string) error {
 			Revoked: c.Revoked, RevokedAt: c.RevokedAt, Expires: c.Expires,
 			CRLPublished: c.CRLPublished, CRLKnownAt: c.CRLKnownAt,
 			CRLDelayMin: c.CRLDelayMin, LearnedAt: c.LearnedAt,
+			CRLIssues:   append([]CRLIssue{}, c.CRLIssues...),
 			Revocations: append([]RevocationRecord{}, c.Revocations...),
 		}
 		for _, u := range c.Cert.ExtKeyUsage {
@@ -116,7 +118,18 @@ func LoadLab(path string) (*Lab, error) {
 			Revoked: cs.Revoked, RevokedAt: cs.RevokedAt, Expires: cs.Expires,
 			CRLPublished: cs.CRLPublished, CRLKnownAt: cs.CRLKnownAt,
 			CRLDelayMin: cs.CRLDelayMin, LearnedAt: cs.LearnedAt,
+			CRLIssues:   append([]CRLIssue{}, cs.CRLIssues...),
 			Revocations: append([]RevocationRecord{}, cs.Revocations...),
+		}
+		// Snapshots written before CRL issuance logs existed: rebuild one
+		// issuance from the recorded first-knowledge time so historical
+		// reports remain explainable after reopening.
+		if c.Kind != KindLeaf && c.CRLPublished && len(c.CRLIssues) == 0 && !c.CRLKnownAt.IsZero() {
+			c.CRLIssues = append(c.CRLIssues, CRLIssue{
+				ThisUpdate: c.CRLKnownAt.Add(-time.Minute),
+				NextUpdate: c.CRLKnownAt.Add(time.Hour),
+				LearnedAt:  c.CRLKnownAt,
+			})
 		}
 		for _, u := range cs.EKUs {
 			c.EKUs = append(c.EKUs, x509.ExtKeyUsage(u))

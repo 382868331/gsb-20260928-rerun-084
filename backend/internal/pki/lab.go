@@ -77,6 +77,7 @@ func (l *Lab) AddRoot(id, cn string, years int) (*Cert, error) {
 	c.CRLKnownAt = now.UTC()
 	c.LearnedAt = now.UTC()
 	l.put(c)
+	l.issueCRLLocked(c, now)
 	l.trustLog = append(l.trustLog, TrustEvent{RootID: id, Trusted: true, EffectiveAt: now.UTC(), LearnedAt: now.UTC()})
 	l.rulesVersion++
 	return c, nil
@@ -117,6 +118,7 @@ func (l *Lab) AddIntermediate(id, cn, issuerID, crossSubjectID string, years int
 	c.CRLKnownAt = now.UTC()
 	c.LearnedAt = now.UTC()
 	l.put(c)
+	l.issueCRLLocked(c, now)
 	return c, nil
 }
 
@@ -379,6 +381,7 @@ func (l *Lab) RevokeAt(id string, revokedAt time.Time) error {
 	c.Revocations = append(c.Revocations, RevocationRecord{
 		RevokedAt: revokedAt, LearnedAt: now, Note: note,
 	})
+	l.reissueIssuerCRLLocked(c, now)
 	l.rulesVersion++
 	return nil
 }
@@ -407,6 +410,7 @@ func (l *Lab) RetractRevocation(id, note string) error {
 	})
 	c.Revoked = false
 	c.RevokedAt = time.Time{}
+	l.reissueIssuerCRLLocked(c, now)
 	l.rulesVersion++
 	return nil
 }
@@ -431,8 +435,20 @@ func (l *Lab) CorrectRevocation(id string, revokedAt time.Time) error {
 		RevokedAt: revokedAt.UTC(), LearnedAt: now, Note: "corrected revocation date",
 	})
 	c.RevokedAt = revokedAt.UTC()
+	l.reissueIssuerCRLLocked(c, now)
 	l.rulesVersion++
 	return nil
+}
+
+// reissueIssuerCRLLocked records a fresh CRL issuance by the CA that
+// issued c, modelling the CA republishing its revocation list when the
+// revocation state of one of its certificates changes.
+func (l *Lab) reissueIssuerCRLLocked(c *Cert, now time.Time) {
+	issuer, ok := l.certs[c.IssuerID]
+	if !ok || issuer.Kind == KindLeaf || !issuer.CRLPublished {
+		return
+	}
+	l.issueCRLLocked(issuer, now)
 }
 
 // revocationAtLocked returns the latest revocation claim learned on or
@@ -504,6 +520,7 @@ func (l *Lab) SetCRLPublished(caID string, published bool) error {
 		c.CRLPublished = published
 		if published {
 			c.CRLKnownAt = l.nowFunc().UTC()
+			l.issueCRLLocked(c, l.nowFunc())
 		}
 		l.rulesVersion++
 	}
@@ -536,10 +553,12 @@ func (l *Lab) SetCRLDelay(caID string, minutes int) error {
 
 // CRL renders a fresh X.509 CRL for a CA node containing every currently
 // revoked certificate that the CA issued. It is generated on demand, so it
-// can never serve stale revocation data.
+// can never serve stale revocation data. Each fetch is recorded in the
+// CA's issuance log so later historical investigations can cite the exact
+// coverage interval that was learnable then.
 func (l *Lab) CRL(caID string) ([]byte, error) {
-	l.mu.RLock()
-	defer l.mu.RUnlock()
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	ca, ok := l.certs[caID]
 	if !ok {
 		return nil, fmt.Errorf("ca %q not found", caID)
@@ -551,13 +570,67 @@ func (l *Lab) CRL(caID string) ([]byte, error) {
 }
 
 func (l *Lab) buildCRLLocked(ca *Cert) ([]byte, error) {
-	return l.buildCRLAtLocked(ca, l.nowFunc(), l.nowFunc())
+	now := l.nowFunc()
+	iss := l.issueCRLLocked(ca, now)
+	return l.buildCRLAtLocked(ca, iss, now)
 }
 
-// buildCRLAtLocked renders the CRL as it was knowable at the knowledge
-// cutoff, dated relative to asOf: entries only include revocation claims
-// learned on or before cutoff, each with its own effective RevokedAt.
-func (l *Lab) buildCRLAtLocked(ca *Cert, asOf, cutoff time.Time) ([]byte, error) {
+// issueCRLLocked records a fresh CRL issuance for ca as of now and
+// returns it. The coverage interval is frozen at issuance: later queries
+// with a different knowledge cutoff select among these records but never
+// rewrite their times.
+func (l *Lab) issueCRLLocked(ca *Cert, now time.Time) CRLIssue {
+	now = now.UTC()
+	iss := CRLIssue{
+		ThisUpdate: now.Add(-time.Minute).Add(time.Duration(ca.CRLDelayMin) * time.Minute),
+		NextUpdate: now.Add(time.Hour),
+		LearnedAt:  now,
+	}
+	ca.CRLIssues = append(ca.CRLIssues, iss)
+	return iss
+}
+
+// crlIssueCoveringLocked returns the latest CRL issuance learned on or
+// before the knowledge cutoff whose coverage interval contains
+// eventTime. The boolean reports whether any such issuance is known.
+func crlIssueCoveringLocked(ca *Cert, eventTime, cutoff time.Time) (CRLIssue, bool) {
+	var iss CRLIssue
+	known := false
+	for _, it := range ca.CRLIssues {
+		if it.LearnedAt.After(cutoff) {
+			continue
+		}
+		if eventTime.Before(it.ThisUpdate) || eventTime.After(it.NextUpdate) {
+			continue
+		}
+		if !known || it.LearnedAt.After(iss.LearnedAt) {
+			iss, known = it, true
+		}
+	}
+	return iss, known
+}
+
+// crlIssueLatestLocked returns the latest CRL issuance learned on or
+// before the knowledge cutoff, regardless of coverage.
+func crlIssueLatestLocked(ca *Cert, cutoff time.Time) (CRLIssue, bool) {
+	var iss CRLIssue
+	known := false
+	for _, it := range ca.CRLIssues {
+		if it.LearnedAt.After(cutoff) {
+			continue
+		}
+		if !known || it.LearnedAt.After(iss.LearnedAt) {
+			iss, known = it, true
+		}
+	}
+	return iss, known
+}
+
+// buildCRLAtLocked renders the CRL identified by iss as it was knowable
+// at the knowledge cutoff: the coverage interval comes from the frozen
+// issuance record, and entries only include revocation claims learned on
+// or before cutoff, each with its own effective RevokedAt.
+func (l *Lab) buildCRLAtLocked(ca *Cert, iss CRLIssue, cutoff time.Time) ([]byte, error) {
 	entries := []x509.RevocationListEntry{}
 	for _, c := range l.certs {
 		if c.IssuerID != ca.ID {
@@ -572,8 +645,8 @@ func (l *Lab) buildCRLAtLocked(ca *Cert, asOf, cutoff time.Time) ([]byte, error)
 	}
 	tmpl := &x509.RevocationList{
 		Number:                    new(big.Int).SetUint64(l.seq.Add(1)),
-		ThisUpdate:                asOf.Add(-time.Minute).Add(time.Duration(ca.CRLDelayMin) * time.Minute),
-		NextUpdate:                asOf.Add(time.Hour),
+		ThisUpdate:                iss.ThisUpdate,
+		NextUpdate:                iss.NextUpdate,
 		RevokedCertificateEntries: entries,
 	}
 	signer, ok := ca.Key.(crypto.Signer)

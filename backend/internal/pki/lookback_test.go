@@ -38,7 +38,7 @@ func TestLateLearnedRevocationDualLookback(t *testing.T) {
 	l, cur := clockLab(t, t0)
 	buildChain(t, l)
 
-	event := t0.Add(2 * time.Hour)
+	event := t0.Add(30 * time.Minute)
 	learned := event.Add(-10 * time.Minute)
 	*cur = learned
 	if err := l.Revoke("leaf1"); err != nil {
@@ -86,10 +86,18 @@ func TestCorrectedRevocationDate(t *testing.T) {
 	if err := l.Revoke("leaf1"); err != nil {
 		t.Fatal(err)
 	}
+	// The investigator fetches the root CA's current CRL, so a coverage
+	// interval learnable at t5 exists for the event period.
+	if _, err := l.CRL("r1"); err != nil {
+		t.Fatal(err)
+	}
 	t6 := t0.Add(6 * time.Hour)
 	*cur = t6
 	// Correction: the certificate was actually revoked one hour after t0.
 	if err := l.CorrectRevocation("leaf1", t0.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.CRL("r1"); err != nil {
 		t.Fatal(err)
 	}
 
