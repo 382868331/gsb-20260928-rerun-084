@@ -476,7 +476,8 @@ func (l *Lab) evaluateChain(chain []*Cert, wantEKU x509.ExtKeyUsage, eventTime, 
 		report.Evidence = append(report.Evidence, MaterialRef{
 			Type: "crl", ID: ca.ID, Label: ca.Label,
 			EffectiveAt: &thisUpdate, LearnedAt: &knownAt,
-			Detail: "覆盖 " + crl.ThisUpdate.Format(time.RFC3339) + " → " + crl.NextUpdate.Format(time.RFC3339),
+			Detail: "覆盖区间 " + crl.ThisUpdate.Format(time.RFC3339) + " → " + crl.NextUpdate.Format(time.RFC3339) +
+				"（生效时间为材料实际时间，不随查询截止点移动）",
 		})
 		if eventTime.Before(crl.ThisUpdate) {
 			return missingCRLVerdict(pol, fmt.Sprintf(

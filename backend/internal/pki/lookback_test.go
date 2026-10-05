@@ -148,15 +148,14 @@ func TestTrustEvaluatedAtKnowledgeCutoff(t *testing.T) {
 	}
 
 	// The distrust took effect at t4, after the event: the event must not
-	// be retroactively condemned by the later trust state. (The verdict
-	// here is undetermined only because the CRL known at the late cutoff
-	// does not reach back to the event — a missing-evidence cause, not a
-	// trust cause.)
+	// be retroactively condemned by the later trust state. The CRL's
+	// effective time is anchored at the material's actual time, so the
+	// later cutoff still covers the event and the verdict stays valid.
 	afterDistrust, err := l.VerifyAt("leaf1", EKUServer, nil, event, t4.Add(time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if afterDistrust.Status == StatusDisqualified || afterDistrust.Cause == CauseTrust {
+	if !afterDistrust.Valid || afterDistrust.Cause == CauseTrust {
 		t.Fatalf("later distrust must not condemn an earlier event, got %v %q cause=%q",
 			afterDistrust.Status, afterDistrust.Reason, afterDistrust.Cause)
 	}
@@ -207,18 +206,24 @@ func TestExpiryBoundaryAtEventTime(t *testing.T) {
 	}
 }
 
-// When no revocation material covers the event period the path stays
-// undetermined instead of being forced into pass or fail.
+// Revocation material keeps its actual effective time no matter where
+// the knowledge cutoff sits: an event before the material's effective
+// time stays undetermined (the material was not yet effective then),
+// while an event inside the coverage interval validates at any cutoff —
+// moving the cutoff never rewrites the material's times.
 func TestMissingCoverageStaysUndetermined(t *testing.T) {
 	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	l, cur := clockLab(t, t0)
 	buildChain(t, l)
 	*cur = t0.Add(3 * time.Hour)
 
-	// Event 30 minutes after issuance; the CRL known at the cutoff is
-	// dated near the cutoff and does not reach back to the event.
-	event := t0.Add(30 * time.Minute)
-	res, err := l.VerifyAt("leaf1", EKUServer, nil, event, t0.Add(3*time.Hour))
+	// Late revocation material: known since issuance but only effective
+	// 30 minutes later. An event before that moment is not covered.
+	if err := l.SetCRLDelay("im1", 30); err != nil {
+		t.Fatal(err)
+	}
+	event := t0.Add(10 * time.Minute)
+	res, err := l.VerifyAt("leaf1", EKUServer, nil, event, t0.Add(10*time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,6 +232,37 @@ func TestMissingCoverageStaysUndetermined(t *testing.T) {
 	}
 	if !strings.Contains(res.Reason, "does not cover the event time") {
 		t.Fatalf("expected coverage reason, got %q", res.Reason)
+	}
+
+	// An event inside the coverage interval validates both at an early
+	// and at a much later knowledge cutoff: the material's effective
+	// time is anchored at its actual time, not rewritten by the cutoff.
+	covered := t0.Add(45 * time.Minute)
+	early, err := l.VerifyAt("leaf1", EKUServer, nil, covered, t0.Add(45*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !early.Valid {
+		t.Fatalf("event inside the coverage interval must validate: %s", early.Reason)
+	}
+	late, err := l.VerifyAt("leaf1", EKUServer, nil, covered, t0.Add(3*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !late.Valid {
+		t.Fatalf("later knowledge cutoff must not push the CRL effective time past the event: %s", late.Reason)
+	}
+	crlTime := func(res *VerifyResult) time.Time {
+		for _, m := range res.Chains[0].Evidence {
+			if m.Type == "crl" {
+				return *m.EffectiveAt
+			}
+		}
+		t.Fatal("crl material missing from evidence")
+		return time.Time{}
+	}
+	if !crlTime(early).Equal(crlTime(late)) {
+		t.Fatalf("CRL effective time moved with the cutoff: %s vs %s", crlTime(early), crlTime(late))
 	}
 }
 

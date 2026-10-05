@@ -269,3 +269,129 @@ func TestPersistRoundTrip(t *testing.T) {
 		t.Fatalf("restored lab must verify leaf-rotated: %s", res.Reason)
 	}
 }
+
+// The same event re-checked at early and late knowledge cutoffs, with
+// late-arriving revocation and correction material added in between:
+// every saved report keeps explaining its own basis after a restart, and
+// the revocation material's times never move with the query cutoff.
+func TestRecheckAcrossCutoffsWithLateAndCorrectedMaterial(t *testing.T) {
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	l, cur := clockLab(t, t0)
+	buildChain(t, l)
+
+	event := t0.Add(time.Hour)
+
+	// Report 1: material already effective at the time — valid.
+	*cur = event
+	r1, err := l.VerifyAt("leaf1", EKUServer, nil, event, event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !r1.Valid {
+		t.Fatalf("report 1 must validate with then-current material: %s", r1.Reason)
+	}
+
+	// Late-arriving revocation: learned at t0+3h, effective before the event.
+	*cur = t0.Add(3 * time.Hour)
+	if err := l.RevokeAt("leaf1", t0.Add(30*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Report 2: same event, cutoff before the material was learned — the
+	// late material must not leak backwards; still valid.
+	r2, err := l.VerifyAt("leaf1", EKUServer, nil, event, t0.Add(2*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !r2.Valid {
+		t.Fatalf("report 2 cutoff predates the late material: %s", r2.Reason)
+	}
+
+	// Report 3: same event, cutoff after learning — the backdated
+	// revocation covers the event; disqualified with a revocation cause.
+	r3, err := l.VerifyAt("leaf1", EKUServer, nil, event, t0.Add(3*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r3.Valid || r3.Cause != CauseRevocation {
+		t.Fatalf("report 3 must see the late revocation, got %v %q cause=%q", r3.Valid, r3.Reason, r3.Cause)
+	}
+
+	// Correction learned even later: the revocation actually took effect
+	// after the event. Report 4 clears the event again, while report 3
+	// keeps its own basis.
+	*cur = t0.Add(4 * time.Hour)
+	if err := l.CorrectRevocation("leaf1", t0.Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	r4, err := l.VerifyAt("leaf1", EKUServer, nil, event, t0.Add(4*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !r4.Valid {
+		t.Fatalf("report 4 must apply the corrected effective time: %s", r4.Reason)
+	}
+
+	// Material times must not move with the query cutoff: the reports
+	// that reached the CRL check (1, 2 and 4) rely on the same CRL
+	// material with the same effective time.
+	crlEffective := func(res *VerifyResult) time.Time {
+		for _, ch := range res.Chains {
+			for _, m := range ch.Evidence {
+				if m.Type == "crl" {
+					return *m.EffectiveAt
+				}
+			}
+		}
+		t.Fatal("crl material missing from evidence")
+		return time.Time{}
+	}
+	if !crlEffective(r1).Equal(crlEffective(r2)) || !crlEffective(r1).Equal(crlEffective(r4)) {
+		t.Fatal("CRL effective time must not be rewritten by the knowledge cutoff")
+	}
+
+	// Save and reopen: every original report is still there, unchanged,
+	// and each report's materials explain its own conclusion — every
+	// material was learned on or before that report's knowledge cutoff.
+	path := t.TempDir() + "/state.json"
+	if err := l.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	back, err := LoadLab(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hist := back.History() // newest first
+	if len(hist) != 4 {
+		t.Fatalf("expected 4 saved reports, got %d", len(hist))
+	}
+	wantValid := []bool{true, true, false, true} // reports 1..4, oldest first
+	for i, want := range wantValid {
+		res := hist[len(hist)-1-i]
+		if res.Valid != want {
+			t.Fatalf("report %d changed across reopen: valid=%v want %v", i+1, res.Valid, want)
+		}
+		if !res.EventTime.Equal(event) {
+			t.Fatalf("report %d must investigate the same event, got %s", i+1, res.EventTime)
+		}
+		for _, ch := range res.Chains {
+			for _, m := range ch.Evidence {
+				if m.LearnedAt != nil && m.LearnedAt.After(res.KnowledgeCutoff) {
+					t.Fatalf("report %d relies on %s/%s learned after its cutoff",
+						i+1, m.Type, m.ID)
+				}
+			}
+		}
+	}
+	// Report 3's basis names the late revocation with its actual times.
+	revBasis := false
+	for _, m := range hist[1].Chains[0].Evidence {
+		if m.Type == "revocation" && m.EffectiveAt != nil && !m.EffectiveAt.After(event) &&
+			m.LearnedAt != nil && m.LearnedAt.After(event) {
+			revBasis = true
+		}
+	}
+	if !revBasis {
+		t.Fatal("report 3 must cite the late-learned revocation with effective<learned times")
+	}
+}

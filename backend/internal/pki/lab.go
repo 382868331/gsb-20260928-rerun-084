@@ -555,8 +555,16 @@ func (l *Lab) buildCRLLocked(ca *Cert) ([]byte, error) {
 }
 
 // buildCRLAtLocked renders the CRL as it was knowable at the knowledge
-// cutoff, dated relative to asOf: entries only include revocation claims
-// learned on or before cutoff, each with its own effective RevokedAt.
+// cutoff: entries only include revocation claims learned on or before
+// cutoff, each with its own effective RevokedAt. The coverage interval
+// keeps the material's actual times instead of being rewritten by the
+// query cutoff: ThisUpdate is anchored at the moment the lab first
+// obtained this CA's revocation publication (plus any configured delay,
+// which models material that is known but not yet effective), while
+// NextUpdate extends past asOf because a CA that still publishes at the
+// cutoff keeps its revocation data current. Moving the knowledge cutoff
+// therefore never shifts the material's effective time, so a later
+// review of an earlier event sees the same coverage start.
 func (l *Lab) buildCRLAtLocked(ca *Cert, asOf, cutoff time.Time) ([]byte, error) {
 	entries := []x509.RevocationListEntry{}
 	for _, c := range l.certs {
@@ -570,9 +578,14 @@ func (l *Lab) buildCRLAtLocked(ca *Cert, asOf, cutoff time.Time) ([]byte, error)
 			})
 		}
 	}
+	thisUpdate := ca.CRLKnownAt
+	if thisUpdate.IsZero() {
+		thisUpdate = asOf
+	}
+	thisUpdate = thisUpdate.Add(-time.Minute).Add(time.Duration(ca.CRLDelayMin) * time.Minute)
 	tmpl := &x509.RevocationList{
 		Number:                    new(big.Int).SetUint64(l.seq.Add(1)),
-		ThisUpdate:                asOf.Add(-time.Minute).Add(time.Duration(ca.CRLDelayMin) * time.Minute),
+		ThisUpdate:                thisUpdate,
 		NextUpdate:                asOf.Add(time.Hour),
 		RevokedCertificateEntries: entries,
 	}
